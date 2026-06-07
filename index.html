@@ -352,134 +352,158 @@ function faceUbiquiti(item, cables, selectedPort) {
   const sfp = item.sfp || 0;
   const mainPorts = (item.portObjects || []).slice(0, item.ports - sfp);
   const sfpPorts  = (item.portObjects || []).slice(item.ports - sfp);
+  const cols = Math.ceil(mainPorts.length / 2);
 
-  // Real USW-24-POE: light silver-grey aluminium chassis
+  // Warm silver-grey — matches real USW-24-POE exactly
   const wrap = el('div', { style:
     `height:${h}px;position:relative;overflow:hidden;` +
-    `background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 20%,#bebebe 80%,#b0b0b0 100%);` +
-    `border-top:1px solid #e0e0e0;border-bottom:1px solid #999;` +
-    `box-shadow:inset 0 1px 0 rgba(255,255,255,0.6),inset 0 -1px 0 rgba(0,0,0,0.2)` });
+    `background:linear-gradient(180deg,#c8caca 0%,#b8bbbb 30%,#b0b3b3 70%,#a8abab 100%);` +
+    `border-top:2px solid #d8dada;border-bottom:2px solid #888;` +
+    `box-shadow:inset 0 1px 0 rgba(255,255,255,0.5),inset 0 -1px 0 rgba(0,0,0,0.15)` });
 
-  // Mounting screws (light grey chassis)
-  screws(wrap, h, '#aaa', '#c8c8c8');
+  // Mounting screws
+  [[4,5],[h-12,5],[4,'r'],[h-12,'r']].forEach(([top,side],i) => {
+    const s = el('div', { style:
+      `position:absolute;top:${top}px;${side==='r'?'right':'left'}:5px;` +
+      `width:8px;height:8px;border-radius:50%;` +
+      `background:linear-gradient(145deg,#c0c0c0,#a0a0a0);` +
+      `border:1px solid #888;display:flex;align-items:center;justify-content:center;` });
+    s.appendChild(el('div',{style:`width:${i%2===0?4:1}px;height:${i%2===0?1:4}px;background:#888;border-radius:1px;`}));
+    wrap.appendChild(s);
+  });
 
-  // Inner layout
   const inner = el('div', { style:
-    `position:absolute;left:18px;right:18px;top:0;bottom:0;` +
-    `display:flex;align-items:center;gap:6px;padding:0 4px;` });
+    `position:absolute;left:20px;right:20px;top:0;bottom:0;` +
+    `display:flex;align-items:center;gap:6px;padding:0 2px;` });
 
-  // ── Ubiquiti logo (left) ──
+  // ── Logo block ──
   const logoBlock = el('div', { style:
-    `flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:2px;width:36px;` });
-  // Concentric circles logo
-  const svgLogo = document.createElementNS('http://www.w3.org/2000/svg','svg');
-  svgLogo.setAttribute('width','24'); svgLogo.setAttribute('height','24');
-  svgLogo.setAttribute('viewBox','0 0 24 24');
-  svgLogo.innerHTML =
-    '<circle cx="12" cy="12" r="11" fill="none" stroke="#0059cc" stroke-width="2"/>' +
-    '<circle cx="12" cy="12" r="7"  fill="none" stroke="#0059cc" stroke-width="1.8"/>' +
-    '<circle cx="12" cy="12" r="3"  fill="#0059cc"/>';
-  logoBlock.appendChild(svgLogo);
-  logoBlock.appendChild(el('div',{style:`font-size:5px;color:#0059cc;font-weight:700;letter-spacing:0.5px;`},'UniFi'));
-  logoBlock.appendChild(el('div',{style:`font-size:3.8px;color:#666;white-space:nowrap;overflow:hidden;max-width:36px;text-align:center;`}, item.name||''));
+    `flex-shrink:0;display:flex;flex-direction:column;align-items:center;` +
+    `gap:1px;width:34px;` });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','22'); svg.setAttribute('height','22');
+  svg.setAttribute('viewBox','0 0 22 22');
+  svg.innerHTML =
+    '<circle cx="11" cy="11" r="10" fill="none" stroke="#0050bb" stroke-width="2.2"/>' +
+    '<circle cx="11" cy="11" r="6.2" fill="none" stroke="#0050bb" stroke-width="1.8"/>' +
+    '<circle cx="11" cy="11" r="2.8" fill="#0050bb"/>';
+  logoBlock.appendChild(svg);
+  logoBlock.appendChild(el('div',{style:`font-size:5px;color:#0050bb;font-weight:700;letter-spacing:0.3px;`},'UniFi'));
+  logoBlock.appendChild(el('div',{style:`font-size:3.5px;color:#666;white-space:nowrap;max-width:34px;overflow:hidden;text-align:center;`},item.name||''));
   inner.appendChild(logoBlock);
 
-  // ── 2-row port grid (odd top, even bottom — exactly like real device) ──
-  // Split into columns of 2
-  const cols = Math.ceil(mainPorts.length / 2);
-  const portW = Math.min(18, Math.floor((h * 5.5) / 2 / cols));  // auto-fit
-  const portH = portW + 2;
-  const colGap = Math.max(1, Math.min(3, Math.floor((h * 5 - cols * portW) / cols)));
+  // ── Port columns (2 rows, paired) ──
+  // Calculate port size to fill available width nicely
+  const availW = 520; // approximate available px in rack
+  const colW = Math.floor((availW - cols * 2) / cols);
+  const portW = Math.min(Math.max(colW - 2, 8), 20);
+  const portH = Math.round(portW * 0.85);
+  const colGap = Math.max(1, Math.min(3, Math.floor((h * 11 - cols*(portW+2)) / Math.max(cols,1))));
 
-  const portsWrap = el('div', {style:`flex:1;display:flex;gap:${colGap}px;align-items:center;justify-content:flex-start;`});
+  const portsArea = el('div', {style:`flex:1;display:flex;gap:${colGap}px;align-items:center;`});
 
-  // Build columns: each column = top port (odd) + bottom port (even)
-  for (let col = 0; col < cols; col++) {
-    const topPort = mainPorts[col * 2];       // odd  (1,3,5...)
-    const botPort = mainPorts[col * 2 + 1];   // even (2,4,6...)
+  for (let c = 0; c < cols; c++) {
+    const topP = mainPorts[c * 2];
+    const botP = mainPorts[c * 2 + 1];
 
-    const colDiv = el('div', {style:`display:flex;flex-direction:column;gap:2px;align-items:center;`});
+    const colEl = el('div', {style:`display:flex;flex-direction:column;align-items:center;gap:1px;`});
 
-    // LED above each column
-    const ledRow = el('div', {style:`display:flex;gap:2px;`});
-    [topPort, botPort].forEach(p => {
+    // LED indicator above each column pair
+    const ledWrap = el('div', {style:`display:flex;gap:1px;margin-bottom:1px;`});
+    [topP,botP].forEach(p => {
       if (!p) return;
-      const c = cables.find(x => x.fromPortId===p.id || x.toPortId===p.id);
-      ledRow.appendChild(el('div',{style:
-        `width:${portW-1}px;height:3px;border-radius:1px;flex-shrink:0;` +
-        `background:${c ? c.color : '#22c55e'};opacity:${c ? 1 : 0.8};` +
-        `box-shadow:${c ? `0 0 4px ${c.color}` : '0 0 3px rgba(34,197,94,0.5)'};`}));
+      const cable = cables.find(x=>x.fromPortId===p.id||x.toPortId===p.id);
+      const col = cable ? cable.color : '#22c55e';
+      ledWrap.appendChild(el('div',{style:
+        `width:${Math.ceil(portW/2)-1}px;height:3px;border-radius:1px;flex-shrink:0;` +
+        `background:${col};opacity:${cable?1:0.85};` +
+        `box-shadow:0 0 ${cable?5:3}px ${col};`}));
     });
-    colDiv.appendChild(ledRow);
+    colEl.appendChild(ledWrap);
 
-    // Top port
-    if (topPort) {
-      const btn = portBtn(topPort, item, cables, selectedPort, portW, portH, 2);
-      // Light chassis port style
-      btn.style.background = 'linear-gradient(180deg,#222 0%,#111 60%,#0d0d0d 100%)';
-      btn.style.border = '1px solid #555';
-      btn.style.borderRadius = '2px';
-      btn.style.boxShadow = 'inset 0 2px 3px rgba(0,0,0,0.8),inset 0 -1px 0 rgba(255,255,255,0.04)';
-      // RJ45 tab detail
-      const tab = el('div',{style:`position:absolute;bottom:2px;left:20%;right:20%;height:2px;background:#1a1a1a;border-radius:1px;`});
-      btn.style.position = 'relative';
-      btn.appendChild(tab);
-      colDiv.appendChild(btn);
-    }
-    // Bottom port
-    if (botPort) {
-      const btn = portBtn(botPort, item, cables, selectedPort, portW, portH, 2);
-      btn.style.background = 'linear-gradient(180deg,#222 0%,#111 60%,#0d0d0d 100%)';
-      btn.style.border = '1px solid #555';
-      btn.style.borderRadius = '2px';
-      btn.style.boxShadow = 'inset 0 2px 3px rgba(0,0,0,0.8),inset 0 -1px 0 rgba(255,255,255,0.04)';
-      const tab = el('div',{style:`position:absolute;bottom:2px;left:20%;right:20%;height:2px;background:#1a1a1a;border-radius:1px;`});
-      btn.style.position = 'relative';
-      btn.appendChild(tab);
-      colDiv.appendChild(btn);
-    }
-
-    portsWrap.appendChild(colDiv);
-  }
-  inner.appendChild(portsWrap);
-
-  // ── SFP+ ports (stacked 2x) ──
-  if (sfpPorts.length > 0) {
-    const sfpBlock = el('div', {style:`flex-shrink:0;display:flex;flex-direction:column;gap:3px;`});
-    sfpPorts.forEach(p => {
-      const c = cables.find(x => x.fromPortId===p.id || x.toPortId===p.id);
-      const col2 = c ? c.color : selectedPort?.portId===p.id ? '#ffd700' : null;
-      const sfpBtn = el('button', {
+    // Make a port button with realistic RJ45 look
+    function makePort(p) {
+      if (!p) return null;
+      const cable = cables.find(x=>x.fromPortId===p.id||x.toPortId===p.id);
+      const sel = selectedPort?.portId===p.id;
+      const pcol = cable?cable.color:sel?'#ffd700':null;
+      const btn = el('button', {
         'data-portid': p.id,
+        title: `Poort ${p.number}${cable?' · verbonden':''}`,
+        onclick: e => { e.stopPropagation(); handlePortClick(item.id,p.id); },
         style:
-          `width:22px;height:${Math.floor(h/2)-4}px;border-radius:3px;padding:0;cursor:pointer;` +
-          `background:linear-gradient(180deg,#1a1a1a,#0d0d0d);` +
-          `border:1px solid ${col2||'#444'};` +
-          `box-shadow:${col2?`0 0 5px ${col2}`:'inset 0 1px 3px rgba(0,0,0,0.8)'};` +
-          `display:flex;align-items:center;justify-content:center;`,
-        onclick: e => { e.stopPropagation(); handlePortClick(item.id, p.id); }
+          `width:${portW}px;height:${portH}px;` +
+          `border-radius:2px;border:none;padding:0;cursor:pointer;` +
+          `flex-shrink:0;position:relative;overflow:hidden;` +
+          `background:linear-gradient(180deg,#1a1a1a 0%,#0d0d0d 100%);` +
+          `box-shadow:${pcol
+            ? `0 0 6px ${pcol},inset 0 0 0 1.5px ${pcol}`
+            : `inset 0 2px 4px rgba(0,0,0,0.9),inset 1px 0 0 rgba(255,255,255,0.03),inset -1px 0 0 rgba(255,255,255,0.03)`};` +
+          `outline:${sel?`2px solid #ffd700`:'none'};outline-offset:1px;`,
       });
-      const slot = el('div',{style:`width:16px;height:6px;background:${col2||'#111'};border-radius:1px;border:1px solid #2a2a2a;`});
-      sfpBtn.appendChild(slot);
-      sfpBlock.appendChild(sfpBtn);
+      // RJ45 inner slot detail
+      const slot = el('div',{style:
+        `position:absolute;left:15%;right:15%;` +
+        `top:${Math.round(portH*0.35)}px;height:${Math.round(portH*0.3)}px;` +
+        `background:${pcol||'#111'};border-radius:1px;` +
+        `border-top:1px solid ${pcol||'#222'};`});
+      btn.appendChild(slot);
+      // 8 gold contacts
+      const contacts = el('div',{style:
+        `position:absolute;left:12%;right:12%;bottom:${Math.round(portH*0.15)}px;` +
+        `height:2px;display:flex;gap:1px;`});
+      for(let i=0;i<8;i++){
+        contacts.appendChild(el('div',{style:
+          `flex:1;height:2px;background:${pcol?pcol:'#2a2a2a'};border-radius:0.5px;`}));
+      }
+      btn.appendChild(contacts);
+      btn.addEventListener('mouseenter',()=>btn.style.filter='brightness(1.4)');
+      btn.addEventListener('mouseleave',()=>btn.style.filter='');
+      return btn;
+    }
+
+    const tp = makePort(topP);
+    const bp = makePort(botP);
+    if(tp) colEl.appendChild(tp);
+    if(bp) colEl.appendChild(bp);
+    portsArea.appendChild(colEl);
+  }
+  inner.appendChild(portsArea);
+
+  // ── SFP+ ──
+  if (sfpPorts.length > 0) {
+    const sfpWrap = el('div',{style:`flex-shrink:0;display:flex;flex-direction:column;gap:3px;`});
+    sfpPorts.forEach(p => {
+      const cable = cables.find(x=>x.fromPortId===p.id||x.toPortId===p.id);
+      const pcol = cable?cable.color:selectedPort?.portId===p.id?'#ffd700':null;
+      const b = el('button',{
+        'data-portid':p.id,
+        style:`width:22px;height:${Math.floor((h-8)/Math.max(sfpPorts.length,1))}px;` +
+          `border-radius:2px;padding:0;cursor:pointer;display:flex;align-items:center;justify-content:center;` +
+          `background:linear-gradient(180deg,#1a1a1a,#0d0d0d);` +
+          `border:1px solid ${pcol||'#333'};` +
+          `box-shadow:${pcol?`0 0 6px ${pcol}`:'inset 0 2px 3px rgba(0,0,0,0.8)'};`,
+        onclick:e=>{e.stopPropagation();handlePortClick(item.id,p.id);}
+      });
+      b.appendChild(el('div',{style:`width:16px;height:5px;background:${pcol||'#111'};border-radius:1px;border:1px solid #222;`}));
+      sfpWrap.appendChild(b);
     });
-    inner.appendChild(sfpBlock);
+    inner.appendChild(sfpWrap);
   }
 
-  // ── Right status LEDs ──
-  const statusBlock = el('div', {style:`flex-shrink:0;background:#1a1a1a;border-radius:3px;padding:4px 6px;display:flex;flex-direction:column;gap:4px;`});
-  [['#22c55e','PWR'],['#22c55e','Link']].forEach(([c,label]) => {
-    const row = el('div', {style:`display:flex;align-items:center;gap:3px;`});
-    row.appendChild(el('div',{style:`width:7px;height:7px;border-radius:50%;background:${c};box-shadow:0 0 6px ${c};flex-shrink:0;`}));
-    row.appendChild(el('span',{style:`font-size:5.5px;color:#888;`},label));
-    statusBlock.appendChild(row);
+  // ── Status LEDs ──
+  const leds = el('div',{style:`flex-shrink:0;background:#111;border-radius:3px;padding:5px 7px;display:flex;flex-direction:column;gap:4px;`});
+  [['#22c55e','PWR'],['#22c55e','Link']].forEach(([c,l])=>{
+    const r=el('div',{style:`display:flex;align-items:center;gap:3px;`});
+    r.appendChild(el('div',{style:`width:7px;height:7px;border-radius:50%;background:${c};box-shadow:0 0 6px ${c};`}));
+    r.appendChild(el('span',{style:`font-size:5.5px;color:#666;`},l));
+    leds.appendChild(r);
   });
-  inner.appendChild(statusBlock);
+  inner.appendChild(leds);
 
   wrap.appendChild(inner);
   return wrap;
 }
-
 
 function faceDark(item, cables, selectedPort, bg, logoHtml, logoColor) {
   const h = item.units * U - 2;
