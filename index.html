@@ -362,17 +362,16 @@ function faceUbiquiti(item, cables, selectedPort) {
   const realImg = DEVICE_IMAGES[item.libId] || DEVICE_IMAGES[item.id];
   if (realImg) {
     const wrap = el('div', { style:
-      `height:${h}px;position:relative;overflow:hidden;background:#111;` +
-      `border-top:1px solid #444;border-bottom:1px solid #111;` });
+      `height:${h}px;width:100%;position:relative;overflow:hidden;background:#111;` +
+      `border-top:1px solid #444;border-bottom:1px solid #111;display:block;` });
     screws(wrap, h, '#1e1e1e', '#2a2a2a');
 
     // Photo fills the entire rack slot
     const img = document.createElement('img');
     img.src = realImg;
     img.style.cssText =
-      'position:absolute;top:0;left:0;width:100%;height:100%;' +
-      'object-fit:fill;' +
-      'image-rendering:auto;';
+      `display:block;width:100%;height:${h}px;` +
+      'object-fit:cover;object-position:center center;';
 
     // Port overlay (invisible click targets over the photo)
     const portOverlay = el('div', { style:
