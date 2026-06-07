@@ -170,6 +170,14 @@ const DragMgr = (() => {
 
 
 
+// ── Embedded device images (base64) ─────────────────────────────────────────
+const DEVICE_IMAGES = {
+  'ub-usw24p':  'data:image/png;base64,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',
+  'ub-usw48p':  'data:image/png;base64,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',  // same image for now, replace when you have the 48p
+  'ub-usw-pro': 'data:image/png;base64,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',
+};
+
+
 // ── Library ───────────────────────────────────────────────────────────────────
 const LIBRARY = [
   { brand:'UBIQUITI', items:[
@@ -242,7 +250,7 @@ function addItem(lib, slotOvr) {
   const portObjects = lib.ports > 0
     ? Array.from({ length: lib.ports }, (_, i) => ({ id: genId(), number: i + 1, label: '' }))
     : [];
-  const ni = { ...lib, id: genId(), slot, customName: '', portObjects };
+  const ni = { ...lib, libId: lib.id, id: genId(), slot, customName: '', portObjects };
   setState(s => ({ rack: { ...s.rack, items: [...s.rack.items, ni] }, selectedId: ni.id }));
   // Auto-fetch image immediately
   fetchDeviceImage(ni);
@@ -349,6 +357,66 @@ function portBtn(port, item, cables, selectedPort, w, h, radius) {
 
 function faceUbiquiti(item, cables, selectedPort) {
   const h = item.units * U - 2;
+
+  // ── Use real photo if available ──
+  const realImg = DEVICE_IMAGES[item.libId] || DEVICE_IMAGES[item.id];
+  if (realImg) {
+    const wrap = el('div', { style:
+      `height:${h}px;position:relative;overflow:hidden;background:#111;` +
+      `border-top:1px solid #444;border-bottom:1px solid #111;` });
+    screws(wrap, h, '#1e1e1e', '#2a2a2a');
+
+    // Photo fills the full height, centered
+    const img = document.createElement('img');
+    img.src = realImg;
+    img.style.cssText =
+      'position:absolute;top:0;left:0;width:100%;height:100%;' +
+      'object-fit:contain;object-position:center center;' +
+      'image-rendering:auto;';
+
+    // Port overlay (invisible click targets over the photo)
+    const portOverlay = el('div', { style:
+      `position:absolute;inset:0;display:flex;align-items:center;` +
+      `padding:0 18%;gap:1%;opacity:0;transition:opacity 0.2s;pointer-events:none;` });
+
+    const sfp = item.sfp || 0;
+    const mainPorts = (item.portObjects || []).slice(0, item.ports - sfp);
+    const cols = Math.ceil(mainPorts.length / 2);
+
+    for (let c = 0; c < cols; c++) {
+      const colEl = el('div', { style: `display:flex;flex-direction:column;gap:1px;flex:1;` });
+      [mainPorts[c*2], mainPorts[c*2+1]].forEach(p => {
+        if (!p) return;
+        const cable = cables.find(x => x.fromPortId===p.id||x.toPortId===p.id);
+        const pcol = cable ? cable.color : selectedPort?.portId===p.id ? '#ffd700' : 'transparent';
+        const btn = el('button', {
+          'data-portid': p.id,
+          title: `Poort ${p.number}${cable?' · verbonden':''}`,
+          style: `flex:1;border-radius:2px;border:2px solid ${pcol};` +
+            `background:${cable?pcol+'33':'transparent'};cursor:pointer;padding:0;` +
+            `box-shadow:${cable?`0 0 6px ${pcol}`:'none'};`,
+          onclick: e => { e.stopPropagation(); handlePortClick(item.id, p.id); }
+        });
+        colEl.appendChild(btn);
+      });
+      portOverlay.appendChild(colEl);
+    }
+
+    wrap.appendChild(img);
+    wrap.appendChild(portOverlay);
+
+    // Show port overlay on hover
+    wrap.addEventListener('mouseenter', () => {
+      portOverlay.style.opacity = '1';
+      portOverlay.style.pointerEvents = 'all';
+    });
+    wrap.addEventListener('mouseleave', () => {
+      portOverlay.style.opacity = '0';
+      portOverlay.style.pointerEvents = 'none';
+    });
+
+    return wrap;
+  }
   const sfp = item.sfp || 0;
   const mainPorts = (item.portObjects || []).slice(0, item.ports - sfp);
   const sfpPorts  = (item.portObjects || []).slice(item.ports - sfp);
@@ -1596,7 +1664,17 @@ document.addEventListener('DOMContentLoaded', () => {
 function buildThumb(item) {
   const wrap = el('div', { style: 'position:absolute;inset:0;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#0d1117' });
 
-  // ── Try GitHub image first ──
+  // ── Try embedded device image first ──
+  const embeddedImg = DEVICE_IMAGES[item.libId] || DEVICE_IMAGES[item.id];
+  if (embeddedImg) {
+    const img = document.createElement('img');
+    img.src = embeddedImg;
+    img.style.cssText = 'width:100%;height:100%;object-fit:contain;object-position:center;display:block;background:#111;';
+    wrap.appendChild(img);
+    return wrap;
+  }
+
+  // ── Try GitHub image ──
   const ghUrl = getDeviceImage(item);
   if (ghUrl) {
     const img = document.createElement('img');
@@ -1604,7 +1682,7 @@ function buildThumb(item) {
     img.style.cssText = 'width:100%;height:100%;object-fit:contain;object-position:center;display:block;background:#1a1a1a;';
     img.onerror = () => { img.style.display='none'; };
     wrap.appendChild(img);
-    if (ghUrl) return wrap; // return even if img might fail — it'll hide itself
+    if (ghUrl) return wrap;
   }
 
   // ── Try auto-fetched image ──
@@ -1669,7 +1747,7 @@ const imageCache = {};     // itemId -> { url, loading, error }
 const pendingFetches = {}; // itemId -> true (prevent duplicate fetches)
 
 async function fetchDeviceImage(item) {
-  const key = item.id;
+  const key = item.libId || item.id;
   if (imageCache[key] || pendingFetches[key]) return;
   pendingFetches[key] = true;
   imageCache[key] = { loading: true };
