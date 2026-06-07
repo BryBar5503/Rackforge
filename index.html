@@ -1,1 +1,2256 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>RackForge v1</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e2e8f0;height:100vh;overflow:hidden;font-size:13px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:#161b22}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+button,input,select,textarea{font-family:inherit;box-sizing:border-box}
+@keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
+.fadein{animation:fadein 0.15s ease}
+input[type=range]{accent-color:#2f81f7;cursor:pointer;height:4px}
+.lib-item{transition:background 0.1s;cursor:pointer}
+.lib-item:hover{background:#1c2333!important}
+.tbtn:hover{background:#21262d!important;color:#e2e8f0!important}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const genId = () => Math.random().toString(36).slice(2,9);
+const U = 44;
 
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  rack: { id:'r1', name:'Demo Project', totalU:16, depth:600, items:[] },
+  cables: [],
+  selectedId: null,
+  selectedPort: null,
+  tool: 'select',
+  cableColor: '#2563eb',
+  zoom: 100,
+  search: '',
+  brands: { UBIQUITI:false, 'TP-LINK OMADA':true, CISCO:false, 'HP / ARUBA':false, PANDUIT:false, GENERIEK:true },
+  showNewRack: false,
+  showPhoto: false,
+  photoImg: null,
+  photoAnalyzing: false,
+  photoResult: null,
+  newRackName: 'Rack 1',
+  newRackU: 16,
+  newRackDepth: 600,
+  dragItem: null,
+  dragOver: null,
+  rackDragId: null,
+  showGithubConfig: false,
+};
+
+function setState(patch) {
+  Object.assign(state, typeof patch === 'function' ? patch(state) : patch);
+  render();
+}
+
+// ── Drag Manager (mouse-based, no HTML5 drag API) ───────────────────────────
+const DragMgr = (() => {
+  let active = false;
+  let libItem = null;
+  let rackItemId = null;
+  let ghost = null;
+  let targetSlot = null;
+
+  function getUnits() {
+    if (libItem) return libItem.units;
+    const it = state.rack?.items?.find(i => i.id === rackItemId);
+    return it ? it.units : 1;
+  }
+
+  function updateHighlight() {
+    const hl = document.getElementById('rack-slot-highlight');
+    if (!hl) return;
+    if (!targetSlot) { hl.style.display = 'none'; return; }
+    const units = getUnits();
+    const maxSlot = (state.rack?.totalU || 1) - units + 1;
+    if (targetSlot < 1 || targetSlot > maxSlot) { hl.style.display = 'none'; return; }
+    hl.style.display = 'block';
+    hl.style.top = ((targetSlot - 1) * U) + 'px';
+    hl.style.height = (units * U) + 'px';
+    const lbl = hl.querySelector('.hl-label');
+    if (lbl) lbl.textContent = units > 1
+      ? `Slot ${targetSlot}–${targetSlot + units - 1}`
+      : `Slot ${targetSlot}`;
+  }
+
+  function onMove(e) {
+    if (!ghost) return;
+    ghost.style.left = e.clientX + 'px';
+    ghost.style.top  = e.clientY + 'px';
+
+    const bay = document.getElementById('rack-bay');
+    if (!bay) { targetSlot = null; updateHighlight(); return; }
+    const r = bay.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+      targetSlot = null; updateHighlight(); return;
+    }
+    const newSlot = Math.max(1, Math.floor((e.clientY - r.top) / U) + 1);
+    if (newSlot !== targetSlot) { targetSlot = newSlot; updateHighlight(); }
+  }
+
+  function onUp() {
+    if (targetSlot) {
+      if (rackItemId) moveRackItem(rackItemId, targetSlot);
+      else if (libItem) addItem(libItem, targetSlot);
+    }
+    cleanup();
+  }
+
+  function cleanup() {
+    active = false;
+    libItem = null;
+    rackItemId = null;
+    targetSlot = null;
+    if (ghost) { ghost.remove(); ghost = null; }
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+    // Clear drag state without re-render loop
+    state.rackDragId = null;
+    state.dragItem = null;
+    const hl = document.getElementById('rack-slot-highlight');
+    if (hl) hl.style.display = 'none';
+    render();
+  }
+
+  return {
+    get active() { return active; },
+    get rackItemId() { return rackItemId; },
+
+    start(lib, rackId, e) {
+      if (active) cleanup(); // safety: end any previous drag
+      active = true;
+      libItem = lib;
+      rackItemId = rackId;
+      targetSlot = null;
+
+      // Ghost label that follows cursor
+      ghost = document.createElement('div');
+      ghost.style.cssText =
+        'position:fixed;z-index:9999;pointer-events:none;' +
+        'background:#1c2333;border:1.5px solid #2f81f7;border-radius:6px;' +
+        'padding:4px 12px;font-size:11px;font-weight:600;color:#79c0ff;' +
+        'white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,0.6);' +
+        'transform:translate(-50%,-120%);font-family:system-ui,sans-serif;';
+      const name = lib ? lib.name : (state.rack?.items?.find(i=>i.id===rackId)?.name || '');
+      const units = getUnits();
+      ghost.textContent = `⬛ ${name}  (${units}U)`;
+      document.body.appendChild(ghost);
+
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'grabbing';
+
+      // Update state so dragging item fades in rack
+      state.rackDragId = rackId;
+      state.dragItem = lib;
+      // Don't call full render() here — just update opacity of the item directly
+      const existing = document.querySelector(`[data-rackid="${rackId}"]`);
+      if (existing) existing.style.opacity = '0.3';
+
+      onMove(e); // position ghost immediately
+    },
+  };
+})();
+
+
+
+// ── Library ───────────────────────────────────────────────────────────────────
+const LIBRARY = [
+  { brand:'UBIQUITI', items:[
+    { id:'ub-usw24p', name:'USW-24-POE',  desc:'UniFi Switch 24 PoE',        units:1, ports:26, portType:'rj45', cat:'switch', sfp:2,  vendor:'ubiquiti' },
+    { id:'ub-usw48p', name:'USW-48-POE',  desc:'UniFi Switch 48 PoE',        units:1, ports:50, portType:'rj45', cat:'switch', sfp:2,  vendor:'ubiquiti' },
+    { id:'ub-usg',    name:'USG-PRO-4',   desc:'UniFi Security Gateway Pro', units:1, ports:4,  portType:'rj45', cat:'router',        vendor:'ubiquiti' },
+    { id:'ub-udm',    name:'UDM-PRO',     desc:'UniFi Dream Machine Pro',    units:2, ports:9,  portType:'rj45', cat:'router',        vendor:'ubiquiti' },
+  ]},
+  { brand:'TP-LINK OMADA', items:[
+    { id:'tp-er8411', name:'ER8411',      desc:'Omada Router with Firewall', units:1, ports:11, portType:'rj45', cat:'router',        vendor:'tplink' },
+    { id:'tp-er7206', name:'ER7206',      desc:'10G Router',                 units:1, ports:6,  portType:'rj45', cat:'router',        vendor:'tplink' },
+    { id:'tp-er605',  name:'ER605',       desc:'Omada Gigabit VPN Router',   units:1, ports:5,  portType:'rj45', cat:'router',        vendor:'tplink' },
+    { id:'tp-mc220l', name:'MC220L',      desc:'Gigabit Media Converter',    units:1, ports:2,  portType:'sfp',  cat:'other',         vendor:'tplink' },
+    { id:'tp-sw24',   name:'TL-SG3428',   desc:'JetStream 24-Port Switch',   units:1, ports:28, portType:'rj45', cat:'switch', sfp:4, vendor:'tplink' },
+  ]},
+  { brand:'CISCO', items:[
+    { id:'cs-24',    name:'C2960X-24TS',  desc:'Catalyst 24-Port Switch',   units:1, ports:24, portType:'rj45', cat:'switch', vendor:'cisco' },
+    { id:'cs-48',    name:'C2960X-48TS',  desc:'Catalyst 48-Port Switch',   units:2, ports:48, portType:'rj45', cat:'switch', vendor:'cisco' },
+    { id:'cs-rv345', name:'RV345',        desc:'Dual WAN Gigabit Router',   units:1, ports:18, portType:'rj45', cat:'router', vendor:'cisco' },
+  ]},
+  { brand:'HP / ARUBA', items:[
+    { id:'hp-24', name:'J9782A', desc:'Aruba 2530-24G Switch', units:1, ports:24, portType:'rj45', cat:'switch', vendor:'hp' },
+    { id:'hp-48', name:'J9781A', desc:'Aruba 2530-48G Switch', units:1, ports:48, portType:'rj45', cat:'switch', vendor:'hp' },
+  ]},
+  { brand:'PANDUIT', items:[
+    { id:'pan-24',  name:'CPPL24WBLY', desc:'24-Port Cat6A Patch Panel', units:1, ports:24, portType:'rj45',  cat:'patch', vendor:'panduit' },
+    { id:'pan-48',  name:'CPPL48WBLY', desc:'48-Port Cat6A Patch Panel', units:1, ports:48, portType:'rj45',  cat:'patch', vendor:'panduit' },
+    { id:'pan-fib', name:'FMDC1',      desc:'12-Port Fiber LC Panel',    units:1, ports:12, portType:'fiber', cat:'patch', vendor:'panduit' },
+  ]},
+  { brand:'GENERIEK', items:[
+    { id:'g-pp24',  name:'Patchpanel 24 poorts',    desc:'Cat6 24-Port',        units:1, ports:24, portType:'rj45', cat:'patch',  vendor:'generic' },
+    { id:'g-pp48',  name:'Patchpanel 48 poorts',    desc:'Cat6 48-Port',        units:1, ports:48, portType:'rj45', cat:'patch',  vendor:'generic' },
+    { id:'g-pp24k', name:'Keystone Patchpanel 24p', desc:'Keystone 24p',        units:1, ports:24, portType:'rj45', cat:'patch',  vendor:'generic' },
+    { id:'g-km1',   name:'Kabelmanagement 1U',      desc:'1U kabelgoot',        units:1, ports:0,  portType:null,   cat:'cable',  vendor:'generic' },
+    { id:'g-km2',   name:'Kabelmanagement 2U',      desc:'2U kabelgoot',        units:2, ports:0,  portType:null,   cat:'cable',  vendor:'generic' },
+    { id:'g-pdu8',  name:'PDU 8-voudig',            desc:'8-weg PDU',           units:1, ports:0,  portType:null,   cat:'power',  vendor:'generic' },
+    { id:'g-pdu12', name:'PDU 12-voudig',           desc:'12-weg PDU',          units:1, ports:0,  portType:null,   cat:'power',  vendor:'generic' },
+    { id:'g-ups',   name:'UPS 1500VA',              desc:'Noodstroom',          units:2, ports:0,  portType:null,   cat:'ups',    vendor:'generic' },
+    { id:'g-srv1',  name:'Server 1U',               desc:'Rackmount server',    units:1, ports:2,  portType:'rj45', cat:'server', vendor:'generic' },
+    { id:'g-srv2',  name:'Server 2U',               desc:'Rackmount server',    units:2, ports:4,  portType:'rj45', cat:'server', vendor:'generic' },
+    { id:'g-blank', name:'Blindpaneel 1U',          desc:'Afdekpaneel',         units:1, ports:0,  portType:null,   cat:'filler', vendor:'generic' },
+  ]},
+];
+
+const CABLE_COLORS = ['#2563eb','#dc2626','#16a34a','#ca8a04','#7c3aed','#ea580c','#db2777','#e2e8f0'];
+
+// ── Logic ─────────────────────────────────────────────────────────────────────
+function getOcc(items) {
+  const s = new Set();
+  items.forEach(x => { for (let u = x.slot; u < x.slot + x.units; u++) s.add(u); });
+  return s;
+}
+
+function findSlot(items, units, totalU) {
+  const occ = getOcc(items);
+  for (let s = 1; s <= totalU - units + 1; s++) {
+    let ok = true;
+    for (let u = s; u < s + units; u++) if (occ.has(u)) { ok = false; break; }
+    if (ok) return s;
+  }
+  return null;
+}
+
+function addItem(lib, slotOvr) {
+  const rack = state.rack;
+  const slot = slotOvr || findSlot(rack.items, lib.units, rack.totalU);
+  if (!slot) return;
+  const occ = getOcc(rack.items);
+  for (let u = slot; u < slot + lib.units; u++) if (occ.has(u)) return;
+  const portObjects = lib.ports > 0
+    ? Array.from({ length: lib.ports }, (_, i) => ({ id: genId(), number: i + 1, label: '' }))
+    : [];
+  const ni = { ...lib, id: genId(), slot, customName: '', portObjects };
+  setState(s => ({ rack: { ...s.rack, items: [...s.rack.items, ni] }, selectedId: ni.id }));
+  // Auto-fetch image immediately
+  fetchDeviceImage(ni);
+}
+
+function removeItem(id) {
+  const it = state.rack.items.find(i => i.id === id);
+  const pids = new Set(it?.portObjects?.map(p => p.id) || []);
+  setState(s => ({
+    rack: { ...s.rack, items: s.rack.items.filter(i => i.id !== id) },
+    cables: s.cables.filter(c => !pids.has(c.fromPortId) && !pids.has(c.toPortId)),
+    selectedId: null,
+  }));
+}
+
+function moveRackItem(itemId, targetSlot) {
+  const rack = state.rack;
+  const item = rack.items.find(i => i.id === itemId);
+  if (!item) return;
+
+  // Check if target slot is free (ignoring the item being moved)
+  const occ = new Set();
+  rack.items.forEach(x => {
+    if (x.id === itemId) return; // skip self
+    for (let u = x.slot; u < x.slot + x.units; u++) occ.add(u);
+  });
+
+  // Check all slots the item needs are free
+  for (let u = targetSlot; u < targetSlot + item.units; u++) {
+    if (u > rack.totalU) return; // out of bounds
+    if (occ.has(u)) return;      // collision
+  }
+
+  setState(s => ({
+    rack: {
+      ...s.rack,
+      items: s.rack.items.map(i => i.id === itemId ? { ...i, slot: targetSlot } : i)
+    }
+  }));
+}
+
+
+function updateItem(id, patch) {
+  setState(s => ({ rack: { ...s.rack, items: s.rack.items.map(i => i.id === id ? { ...i, ...patch } : i) } }));
+}
+
+function handlePortClick(itemId, portId) {
+  if (state.tool !== 'cable') return;
+  if (!state.selectedPort) { setState({ selectedPort: { itemId, portId } }); return; }
+  if (state.selectedPort.portId === portId) { setState({ selectedPort: null }); return; }
+  const already = state.cables.some(c =>
+    (c.fromPortId === state.selectedPort.portId || c.toPortId === state.selectedPort.portId) &&
+    (c.fromPortId === portId || c.toPortId === portId));
+  if (!already) {
+    setState(s => ({ cables: [...s.cables, { id: genId(), fromPortId: s.selectedPort.portId, toPortId: portId, color: s.cableColor }], selectedPort: null }));
+  } else {
+    setState({ selectedPort: null });
+  }
+}
+
+async function analyzePhoto() {
+  if (!state.photoImg) return;
+  setState({ photoAnalyzing: true });
+  try {
+    const b = state.photoImg.split(',')[1], mt = state.photoImg.split(';')[0].split(':')[1];
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 600,
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mt, data: b } },
+          { type: 'text', text: 'Analyseer dit netwerkapparaat. ALLEEN JSON:\n{"brand":"merk","name":"modelnaam","desc":"beschrijving","ports":24,"portType":"rj45","units":1,"cat":"patch","vendor":"generic","notes":"observaties"}' }
+        ]}]})
+    });
+    const d = await res.json();
+    const txt = d.content?.find(c => c.type === 'text')?.text || '';
+    setState({ photoResult: JSON.parse(txt.replace(/```json|```/g, '').trim()), photoAnalyzing: false });
+  } catch(e) {
+    setState({ photoResult: { error: e.message }, photoAnalyzing: false });
+  }
+}
+
+// ── SVG / HTML renderers for device faces ─────────────────────────────────────
+function portBtn(port, item, cables, selectedPort, w, h, radius) {
+  const cable = cables.find(c => c.fromPortId === port.id || c.toPortId === port.id);
+  const sel = selectedPort?.portId === port.id;
+  const col = cable ? cable.color : sel ? '#ffd700' : null;
+  const btn = el('button', {
+    'data-portid': port.id,
+    title: `Poort ${port.number}${cable ? ' · verbonden' : ' · leeg'}`,
+    onclick: e => { e.stopPropagation(); handlePortClick(item.id, port.id); },
+    style: `width:${w}px;height:${h}px;border:none;padding:0;cursor:pointer;flex-shrink:0;border-radius:${radius}px;` +
+      `background:${col || 'linear-gradient(180deg,#1e1e1e,#0d0d0d)'};` +
+      `box-shadow:${col ? `0 0 5px ${col},inset 0 0 0 1px ${col}55` : 'inset 0 1px 0 rgba(255,255,255,0.05),inset 0 -1px 0 rgba(0,0,0,0.8)'};` +
+      `outline:${sel ? '2px solid #ffd700' : 'none'};outline-offset:1px;position:relative;`,
+  });
+  if (radius < 3) {
+    const line = el('div', { style: `position:absolute;bottom:1px;left:12%;right:12%;height:2px;background:${col || '#1a1a1a'};border-radius:1px` });
+    btn.appendChild(line);
+  }
+  btn.addEventListener('mouseenter', () => btn.style.filter = 'brightness(1.5)');
+  btn.addEventListener('mouseleave', () => btn.style.filter = '');
+  return btn;
+}
+
+function faceUbiquiti(item, cables, selectedPort) {
+  const h = item.units * U - 2;
+  const sfp = item.sfp || 0;
+  const mainPorts = (item.portObjects || []).slice(0, item.ports - sfp);
+  const sfpPorts  = (item.portObjects || []).slice(item.ports - sfp);
+
+  // Real USW-24-POE: light silver-grey aluminium chassis
+  const wrap = el('div', { style:
+    `height:${h}px;position:relative;overflow:hidden;` +
+    `background:linear-gradient(180deg,#d8d8d8 0%,#c8c8c8 20%,#bebebe 80%,#b0b0b0 100%);` +
+    `border-top:1px solid #e0e0e0;border-bottom:1px solid #999;` +
+    `box-shadow:inset 0 1px 0 rgba(255,255,255,0.6),inset 0 -1px 0 rgba(0,0,0,0.2)` });
+
+  // Mounting screws (light grey chassis)
+  screws(wrap, h, '#aaa', '#c8c8c8');
+
+  // Inner layout
+  const inner = el('div', { style:
+    `position:absolute;left:18px;right:18px;top:0;bottom:0;` +
+    `display:flex;align-items:center;gap:6px;padding:0 4px;` });
+
+  // ── Ubiquiti logo (left) ──
+  const logoBlock = el('div', { style:
+    `flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:2px;width:36px;` });
+  // Concentric circles logo
+  const svgLogo = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svgLogo.setAttribute('width','24'); svgLogo.setAttribute('height','24');
+  svgLogo.setAttribute('viewBox','0 0 24 24');
+  svgLogo.innerHTML =
+    '<circle cx="12" cy="12" r="11" fill="none" stroke="#0059cc" stroke-width="2"/>' +
+    '<circle cx="12" cy="12" r="7"  fill="none" stroke="#0059cc" stroke-width="1.8"/>' +
+    '<circle cx="12" cy="12" r="3"  fill="#0059cc"/>';
+  logoBlock.appendChild(svgLogo);
+  logoBlock.appendChild(el('div',{style:`font-size:5px;color:#0059cc;font-weight:700;letter-spacing:0.5px;`},'UniFi'));
+  logoBlock.appendChild(el('div',{style:`font-size:3.8px;color:#666;white-space:nowrap;overflow:hidden;max-width:36px;text-align:center;`}, item.name||''));
+  inner.appendChild(logoBlock);
+
+  // ── 2-row port grid (odd top, even bottom — exactly like real device) ──
+  // Split into columns of 2
+  const cols = Math.ceil(mainPorts.length / 2);
+  const portW = Math.min(18, Math.floor((h * 5.5) / 2 / cols));  // auto-fit
+  const portH = portW + 2;
+  const colGap = Math.max(1, Math.min(3, Math.floor((h * 5 - cols * portW) / cols)));
+
+  const portsWrap = el('div', {style:`flex:1;display:flex;gap:${colGap}px;align-items:center;justify-content:flex-start;`});
+
+  // Build columns: each column = top port (odd) + bottom port (even)
+  for (let col = 0; col < cols; col++) {
+    const topPort = mainPorts[col * 2];       // odd  (1,3,5...)
+    const botPort = mainPorts[col * 2 + 1];   // even (2,4,6...)
+
+    const colDiv = el('div', {style:`display:flex;flex-direction:column;gap:2px;align-items:center;`});
+
+    // LED above each column
+    const ledRow = el('div', {style:`display:flex;gap:2px;`});
+    [topPort, botPort].forEach(p => {
+      if (!p) return;
+      const c = cables.find(x => x.fromPortId===p.id || x.toPortId===p.id);
+      ledRow.appendChild(el('div',{style:
+        `width:${portW-1}px;height:3px;border-radius:1px;flex-shrink:0;` +
+        `background:${c ? c.color : '#22c55e'};opacity:${c ? 1 : 0.8};` +
+        `box-shadow:${c ? `0 0 4px ${c.color}` : '0 0 3px rgba(34,197,94,0.5)'};`}));
+    });
+    colDiv.appendChild(ledRow);
+
+    // Top port
+    if (topPort) {
+      const btn = portBtn(topPort, item, cables, selectedPort, portW, portH, 2);
+      // Light chassis port style
+      btn.style.background = 'linear-gradient(180deg,#222 0%,#111 60%,#0d0d0d 100%)';
+      btn.style.border = '1px solid #555';
+      btn.style.borderRadius = '2px';
+      btn.style.boxShadow = 'inset 0 2px 3px rgba(0,0,0,0.8),inset 0 -1px 0 rgba(255,255,255,0.04)';
+      // RJ45 tab detail
+      const tab = el('div',{style:`position:absolute;bottom:2px;left:20%;right:20%;height:2px;background:#1a1a1a;border-radius:1px;`});
+      btn.style.position = 'relative';
+      btn.appendChild(tab);
+      colDiv.appendChild(btn);
+    }
+    // Bottom port
+    if (botPort) {
+      const btn = portBtn(botPort, item, cables, selectedPort, portW, portH, 2);
+      btn.style.background = 'linear-gradient(180deg,#222 0%,#111 60%,#0d0d0d 100%)';
+      btn.style.border = '1px solid #555';
+      btn.style.borderRadius = '2px';
+      btn.style.boxShadow = 'inset 0 2px 3px rgba(0,0,0,0.8),inset 0 -1px 0 rgba(255,255,255,0.04)';
+      const tab = el('div',{style:`position:absolute;bottom:2px;left:20%;right:20%;height:2px;background:#1a1a1a;border-radius:1px;`});
+      btn.style.position = 'relative';
+      btn.appendChild(tab);
+      colDiv.appendChild(btn);
+    }
+
+    portsWrap.appendChild(colDiv);
+  }
+  inner.appendChild(portsWrap);
+
+  // ── SFP+ ports (stacked 2x) ──
+  if (sfpPorts.length > 0) {
+    const sfpBlock = el('div', {style:`flex-shrink:0;display:flex;flex-direction:column;gap:3px;`});
+    sfpPorts.forEach(p => {
+      const c = cables.find(x => x.fromPortId===p.id || x.toPortId===p.id);
+      const col2 = c ? c.color : selectedPort?.portId===p.id ? '#ffd700' : null;
+      const sfpBtn = el('button', {
+        'data-portid': p.id,
+        style:
+          `width:22px;height:${Math.floor(h/2)-4}px;border-radius:3px;padding:0;cursor:pointer;` +
+          `background:linear-gradient(180deg,#1a1a1a,#0d0d0d);` +
+          `border:1px solid ${col2||'#444'};` +
+          `box-shadow:${col2?`0 0 5px ${col2}`:'inset 0 1px 3px rgba(0,0,0,0.8)'};` +
+          `display:flex;align-items:center;justify-content:center;`,
+        onclick: e => { e.stopPropagation(); handlePortClick(item.id, p.id); }
+      });
+      const slot = el('div',{style:`width:16px;height:6px;background:${col2||'#111'};border-radius:1px;border:1px solid #2a2a2a;`});
+      sfpBtn.appendChild(slot);
+      sfpBlock.appendChild(sfpBtn);
+    });
+    inner.appendChild(sfpBlock);
+  }
+
+  // ── Right status LEDs ──
+  const statusBlock = el('div', {style:`flex-shrink:0;background:#1a1a1a;border-radius:3px;padding:4px 6px;display:flex;flex-direction:column;gap:4px;`});
+  [['#22c55e','PWR'],['#22c55e','Link']].forEach(([c,label]) => {
+    const row = el('div', {style:`display:flex;align-items:center;gap:3px;`});
+    row.appendChild(el('div',{style:`width:7px;height:7px;border-radius:50%;background:${c};box-shadow:0 0 6px ${c};flex-shrink:0;`}));
+    row.appendChild(el('span',{style:`font-size:5.5px;color:#888;`},label));
+    statusBlock.appendChild(row);
+  });
+  inner.appendChild(statusBlock);
+
+  wrap.appendChild(inner);
+  return wrap;
+}
+
+
+function faceDark(item, cables, selectedPort, bg, logoHtml, logoColor) {
+  const h = item.units * U - 2;
+  const sfp = item.sfp || 0;
+  const main = (item.portObjects || []).slice(0, item.ports - sfp);
+  const sfps = (item.portObjects || []).slice(item.ports - sfp);
+  const pw = main.length > 36 ? 8 : main.length > 24 ? 9 : item.cat === 'router' ? 16 : 13;
+  const ph = item.cat === 'router' ? 18 : pw + 3;
+  const gap = main.length > 36 ? 1 : main.length > 24 ? 2 : 3;
+  const wrap = el('div', { style: `height:${h}px;background:${bg};display:flex;align-items:center;padding:0 8px;gap:8px;` +
+    `border-top:1px solid rgba(255,255,255,0.08);border-bottom:1px solid rgba(0,0,0,0.8);` +
+    `box-shadow:inset 0 1px 0 rgba(255,255,255,0.06),inset 0 -1px 0 rgba(0,0,0,0.4);` });
+  screws(wrap, h, '#1a1a1a', '#111');
+  // Logo
+  const logo = el('div', { style: 'flex-shrink:0;padding-left:8px;display:flex;flex-direction:column;gap:2px' });
+  logo.innerHTML = logoHtml;
+  logo.appendChild(el('div', { style: 'font-size:5px;color:#555;white-space:nowrap' }, item.name));
+  wrap.appendChild(logo);
+  // LEDs for router
+  if (item.cat === 'router' || item.cat === 'other') {
+    const l = el('div', { style: 'display:flex;flex-direction:column;gap:2px;flex-shrink:0' });
+    [['#22c55e','PWR'],['#22c55e','SYS'],['#3b82f6','ID']].forEach(([c,lbl]) => {
+      const r = el('div', { style: 'display:flex;align-items:center;gap:2px' });
+      r.appendChild(el('div', { style: `width:4px;height:4px;border-radius:50%;background:${c};box-shadow:0 0 3px ${c}` }));
+      r.appendChild(el('span', { style: 'font-size:5px;color:#555' }, lbl));
+      l.appendChild(r);
+    });
+    wrap.appendChild(l);
+  }
+  // Ports + LEDs
+  const portsOuter = el('div', { style: `flex:1;display:flex;flex-direction:column;gap:2px;` });
+  // LED row for switches
+  if (main.length > 4 && item.cat !== 'router') {
+    const lrow = el('div', { style: `display:flex;gap:${gap}px;` });
+    main.forEach(p => {
+      const c = cables.find(x => x.fromPortId === p.id || x.toPortId === p.id);
+      lrow.appendChild(el('div', { style: `width:${pw}px;height:3px;border-radius:1px;flex-shrink:0;background:${c?c.color:logoColor||'#22c55e'};opacity:${c?1:0.3};box-shadow:${c?`0 0 4px ${c.color}`:'none'};` }));
+    });
+    portsOuter.appendChild(lrow);
+  }
+  const portsDiv = el('div', { style: `display:flex;flex-wrap:wrap;gap:${item.cat==='router'?6:gap}px;align-content:center;align-items:center;` });
+  main.forEach(p => portsDiv.appendChild(portBtn(p, item, cables, selectedPort, pw, ph, item.cat==='router'?2:1)));
+  portsOuter.appendChild(portsDiv);
+  wrap.appendChild(portsOuter);
+  // SFP
+  if (sfps.length) {
+    const sfpRow = el('div', { style: 'display:flex;gap:2px;flex-shrink:0' });
+    sfps.forEach(p => {
+      const c = cables.find(x => x.fromPortId === p.id || x.toPortId === p.id);
+      const col2 = c ? c.color : selectedPort?.portId === p.id ? '#ffd700' : null;
+      const b = el('button', { style: `width:18px;height:14px;border:1px solid ${col2||'#333'};padding:0;cursor:pointer;border-radius:2px;background:#1a1a1a` });
+      b.appendChild(el('div', { style: `width:100%;height:4px;background:${col2||'#2a2a2a'};margin-top:4px` }));
+      b.addEventListener('click', e => { e.stopPropagation(); handlePortClick(item.id, p.id); });
+      sfpRow.appendChild(b);
+    });
+    wrap.appendChild(sfpRow);
+  }
+  // Right LEDs
+  const rl = el('div', { style: 'display:flex;flex-direction:column;gap:3px;flex-shrink:0;padding-right:6px' });
+  [['#22c55e','PWR'],['#3b82f6','LNK']].forEach(([c,l]) => {
+    const r = el('div', { style: 'display:flex;align-items:center;gap:2px' });
+    r.appendChild(el('div', { style: `width:5px;height:5px;border-radius:50%;background:${c};box-shadow:0 0 4px ${c}` }));
+    r.appendChild(el('span', { style: 'font-size:5px;color:#555' }, l));
+    rl.appendChild(r);
+  });
+  wrap.appendChild(rl);
+  return wrap;
+}
+
+function facePatch(item, cables, selectedPort) {
+  const h = item.units * U - 2;
+  const fiber = item.portType === 'fiber';
+  const pw = item.ports > 36 ? 8 : item.ports > 24 ? 10 : 13;
+  const wrap = el('div', { style: `height:${h}px;background:linear-gradient(180deg,#111,#080808);display:flex;align-items:center;padding:0 6px;gap:4px;border-top:1px solid #1e1e1e;border-bottom:1px solid #000;box-shadow:inset 0 1px 0 rgba(255,255,255,0.03)` });
+  screws(wrap, h, '#222', '#111');
+  const col2 = el('div', { style: 'flex:1;display:flex;flex-direction:column;gap:2px;justify-content:center' });
+  // number labels
+  const nums = el('div', { style: `display:flex;gap:${pw>10?3:2}px;padding-left:2px` });
+  (item.portObjects || []).filter((_, i) => i % 6 === 0).forEach(p => {
+    nums.appendChild(el('div', { style: `width:${pw*6+(pw>10?3:2)*5}px;font-size:5px;color:#444;text-align:left;flex-shrink:0` }, String(p.number)));
+  });
+  col2.appendChild(nums);
+  const row = el('div', { style: `display:flex;gap:${pw>10?3:2}px` });
+  (item.portObjects || []).forEach(p => {
+    const cable = cables.find(c => c.fromPortId === p.id || c.toPortId === p.id);
+    const sel = selectedPort?.portId === p.id;
+    const pcol = cable ? cable.color : sel ? '#ffd700' : null;
+    const btn = el('button', {
+      'data-portid': p.id,
+      title: `Poort ${p.number}${cable?' · verbonden':' · leeg'}`,
+      onclick: e => { e.stopPropagation(); handlePortClick(item.id, p.id); },
+      style: `width:${pw}px;height:${fiber?pw:pw+1}px;border:none;padding:0;cursor:pointer;flex-shrink:0;border-radius:${fiber?'50%':'2px'};` +
+        `background:${pcol||'linear-gradient(180deg,#1e1e1e,#0d0d0d)'};` +
+        `box-shadow:${pcol?`0 0 5px ${pcol},inset 0 0 0 1px ${pcol}55`:'inset 0 1px 0 rgba(255,255,255,0.04),inset 0 -1px 0 rgba(0,0,0,0.9)'};` +
+        `outline:${sel?'2px solid #ffd700':'none'};outline-offset:1px;position:relative;`,
+    });
+    if (!fiber) btn.appendChild(el('div', { style: `position:absolute;bottom:1px;left:12%;right:12%;height:2px;background:${pcol||'#1a1a1a'};border-radius:1px` }));
+    btn.addEventListener('mouseenter', () => btn.style.filter = 'brightness(1.5)');
+    btn.addEventListener('mouseleave', () => btn.style.filter = '');
+    row.appendChild(btn);
+  });
+  col2.appendChild(row);
+  wrap.appendChild(col2);
+  wrap.appendChild(el('div', { style: 'font-size:6px;font-weight:700;color:#444;letter-spacing:1px;flex-shrink:0;padding-right:8px' }, fiber ? 'FIBER' : 'CAT.6'));
+  return wrap;
+}
+
+function faceCable(item) {
+  const h = item.units * U - 2;
+  const wrap = el('div', { style: `height:${h}px;background:#0d0d0d;display:flex;align-items:center;padding:0 14px;gap:10px;border-top:1px solid #1a1a1a;border-bottom:1px solid #000` });
+  const lbl = el('div');
+  lbl.appendChild(el('div', { style: 'font-size:6px;font-weight:700;color:#444;letter-spacing:1px' }, 'CABLE'));
+  lbl.appendChild(el('div', { style: 'font-size:6px;font-weight:700;color:#444;letter-spacing:1px' }, 'MANAGEMENT'));
+  wrap.appendChild(lbl);
+  const rings = el('div', { style: 'flex:1;display:flex;gap:8px;justify-content:center' });
+  for (let i = 0; i < (item.units === 2 ? 10 : 6); i++) {
+    rings.appendChild(el('div', { style: 'width:24px;height:24px;border-radius:50%;border:2px solid #1e1e1e;background:#080808;box-shadow:inset 0 2px 4px rgba(0,0,0,0.8)' }));
+  }
+  wrap.appendChild(rings);
+  return wrap;
+}
+
+function facePDU(item) {
+  const h = item.units * U - 2;
+  const outlets = item.name?.includes('12') ? 12 : 8;
+  const wrap = el('div', { style: `height:${h}px;background:linear-gradient(180deg,#1a1500,#0f0e00);display:flex;align-items:center;padding:0 10px;gap:8px;border-top:1px solid #252510;border-bottom:1px solid #000` });
+  screws(wrap, h, '#252510', '#111');
+  wrap.appendChild(el('span', { style: 'font-size:7px;font-weight:700;color:#666;letter-spacing:1px;flex-shrink:0' }, 'PDU'));
+  const row = el('div', { style: 'flex:1;display:flex;gap:3px;align-items:center' });
+  for (let i = 0; i < outlets; i++) {
+    const o = el('div', { style: 'width:11px;height:16px;background:#111;border:1px solid #252510;border-radius:2px;display:flex;align-items:center;justify-content:center' });
+    o.appendChild(el('div', { style: `width:5px;height:5px;border-radius:50%;background:${i < outlets-2?'#22c55e':'#1a1a1a'};box-shadow:${i<outlets-2?'0 0 3px #22c55e':'none'}` }));
+    row.appendChild(o);
+  }
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function faceUPS(item) {
+  const h = item.units * U - 2;
+  const wrap = el('div', { style: `height:${h}px;background:linear-gradient(180deg,#111,#0a0a0a);display:flex;align-items:center;padding:0 14px;gap:12px;border-top:1px solid #1a1a1a;border-bottom:1px solid #000` });
+  screws(wrap, h, '#1a1a1a', '#111');
+  const lbl = el('div');
+  lbl.appendChild(el('div', { style: 'font-size:9px;font-weight:700;color:#888;letter-spacing:1px' }, 'UPS'));
+  lbl.appendChild(el('div', { style: 'font-size:6px;color:#555' }, '1500VA'));
+  wrap.appendChild(lbl);
+  const right = el('div', { style: 'flex:1' });
+  const barWrap = el('div', { style: 'display:flex;align-items:center;gap:6px;margin-bottom:4px' });
+  const bar = el('div', { style: 'flex:1;height:10px;background:#111;border:1px solid #222;border-radius:3px;overflow:hidden' });
+  bar.appendChild(el('div', { style: 'width:78%;height:100%;background:linear-gradient(90deg,#f59e0b,#22c55e);border-radius:3px' }));
+  barWrap.appendChild(bar);
+  barWrap.appendChild(el('span', { style: 'font-size:8px;color:#f59e0b;font-weight:600' }, '78%'));
+  right.appendChild(barWrap);
+  const leds = el('div', { style: 'display:flex;gap:8px' });
+  [['#22c55e','PWR'],['#f59e0b','BATT'],['#3b82f6','LOAD']].forEach(([c,l]) => {
+    const r = el('div', { style: 'display:flex;align-items:center;gap:2px' });
+    r.appendChild(el('div', { style: `width:4px;height:4px;border-radius:50%;background:${c};box-shadow:0 0 3px ${c}` }));
+    r.appendChild(el('span', { style: 'font-size:5px;color:#555' }, l));
+    leds.appendChild(r);
+  });
+  right.appendChild(leds);
+  wrap.appendChild(right);
+  return wrap;
+}
+
+function faceServer(item, cables, selectedPort) {
+  const h = item.units * U - 2;
+  const wrap = el('div', { style: `height:${h}px;background:linear-gradient(180deg,#252525,#161616);display:flex;align-items:center;padding:0 8px;gap:8px;border-top:1px solid #333;border-bottom:1px solid #080808;position:relative` });
+  screws(wrap, h, '#333', '#1a1a1a');
+  const drives = el('div', { style: 'display:flex;gap:2px;padding-left:6px' });
+  for (let i = 0; i < (item.units === 2 ? 6 : 3); i++) {
+    const d = el('div', { style: `width:10px;height:${h-16}px;background:linear-gradient(180deg,#2a2a2a,#111);border:1px solid #333;border-radius:2px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding-bottom:2px;gap:1px` });
+    d.appendChild(el('div', { style: `width:5px;height:2px;background:${i%2===0?'#22c55e':'#333'};border-radius:1px` }));
+    drives.appendChild(d);
+  }
+  wrap.appendChild(drives);
+  wrap.appendChild(el('div', { style: 'flex:1' }));
+  const ports = el('div', { style: 'display:flex;gap:4px;align-items:center;padding-right:6px' });
+  (item.portObjects || []).forEach(p => ports.appendChild(portBtn(p, item, cables, selectedPort, 12, 12, 1)));
+  const pwr = el('div', { style: 'width:9px;height:9px;border-radius:50%;border:1px solid #22c55e;display:flex;align-items:center;justify-content:center' });
+  pwr.appendChild(el('div', { style: 'width:4px;height:4px;border-radius:50%;background:#22c55e;box-shadow:0 0 4px #22c55e' }));
+  ports.appendChild(pwr);
+  wrap.appendChild(ports);
+  return wrap;
+}
+
+function faceBlank(item) {
+  const h = item.units * U - 2;
+  return el('div', { style: `height:${h}px;background:repeating-linear-gradient(90deg,#141414 0,#141414 20px,#181818 20px,#181818 21px);border-top:1px solid #1e1e1e;border-bottom:1px solid #080808` });
+}
+
+function screws(parent, h, borderCol, bgCol) {
+  [[4,6,false],[h-12,6,false],[4,6,true],[h-12,6,true]].forEach(([top, side, right], i) => {
+    const s = el('div', { style: `position:absolute;top:${top}px;${right?'right':'left'}:${side}px;width:9px;height:9px;border-radius:50%;border:1px solid ${borderCol};background:${bgCol};display:flex;align-items:center;justify-content:center` });
+    s.appendChild(el('div', { style: `width:${i%2===0?4:1}px;height:${i%2===0?1:4}px;background:${borderCol};border-radius:1px` }));
+    parent.appendChild(s);
+  });
+}
+
+function renderDeviceFace(item, cables, selectedPort) {
+  if (item.vendor === 'ubiquiti' && item.cat === 'switch') return faceUbiquiti(item, cables, selectedPort);
+  if (item.vendor === 'tplink' || (item.vendor === 'ubiquiti' && item.cat !== 'switch'))
+    return faceDark(item, cables, selectedPort, 'linear-gradient(180deg,#2a2a2a,#1e1e1e 50%,#141414)',
+      `<div style="display:flex;align-items:center;gap:3px;margin-bottom:2px"><div style="width:10px;height:10px;background:#4ade80;border-radius:50%;display:flex;align-items:center;justify-content:center"><div style="width:5px;height:5px;background:#111;border-radius:50%;display:flex;align-items:center;justify-content:center"><div style="width:2px;height:2px;background:#4ade80;border-radius:50%"></div></div></div><span style="font-size:6px;font-weight:700;color:#ccc">tp-link</span></div>`, '#4ade80');
+  if (item.vendor === 'cisco')
+    return faceDark(item, cables, selectedPort, 'linear-gradient(180deg,#1e1e1e,#141414)',
+      `<span style="font-size:8px;font-weight:700;color:#fb923c;letter-spacing:1px">CISCO</span>`, '#fb923c');
+  if (item.vendor === 'hp')
+    return faceDark(item, cables, selectedPort, 'linear-gradient(180deg,#1a1a2e,#111122)',
+      `<span style="font-size:7px;font-weight:700;color:#06b6d4">HPE Aruba</span>`, '#06b6d4');
+  if (item.cat === 'patch') return facePatch(item, cables, selectedPort);
+  if (item.cat === 'cable') return faceCable(item);
+  if (item.cat === 'power') return facePDU(item);
+  if (item.cat === 'ups') return faceUPS(item);
+  if (item.cat === 'server') return faceServer(item, cables, selectedPort);
+  if (item.cat === 'filler') return faceBlank(item);
+  return facePatch(item, cables, selectedPort);
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────────
+function el(tag, attrs = {}, text) {
+  const e = document.createElement(tag);
+  Object.entries(attrs).forEach(([k, v]) => {
+    if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  });
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function div(style, children = []) {
+  const d = el('div', { style });
+  children.forEach(c => c && d.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+  return d;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  app.appendChild(buildApp());
+}
+
+
+// ── Render just the library list (no full re-render) ────────────────────────
+function renderLibList() {
+  const container = document.getElementById('lib-list');
+  if (!container) { render(); return; }
+  const { search, brands } = state;
+  const filtLib = LIBRARY.map(b => ({
+    ...b,
+    items: b.items.filter(i => !search ||
+      i.name.toLowerCase().includes(search.toLowerCase()) ||
+      i.desc.toLowerCase().includes(search.toLowerCase()))
+  })).filter(b => b.items.length > 0);
+
+  container.innerHTML = '';
+  filtLib.forEach(brand => {
+    const bOpen = brands[brand.brand];
+    const brandBtn = document.createElement('button');
+    brandBtn.style.cssText = 'width:100%;padding:7px 12px;background:transparent;border:none;color:#c9d1d9;font-size:11px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:space-between;letter-spacing:0.5px';
+    brandBtn.innerHTML = `<span>${bOpen?'▾':'▸'} ${brand.brand}</span><span style="background:#21262d;border-radius:10px;padding:1px 6px;font-size:10px;color:#484f58">${brand.items.length}</span>`;
+    brandBtn.addEventListener('click', () => setState(s => ({ brands: { ...s.brands, [brand.brand]: !s.brands[brand.brand] } })));
+    container.appendChild(brandBtn);
+    if (bOpen) {
+      brand.items.forEach(item => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 12px 6px 22px;cursor:pointer;transition:background 0.1s';
+        row.addEventListener('mouseenter', () => row.style.background = '#1c2333');
+        row.addEventListener('mouseleave', () => row.style.background = '');
+        row.addEventListener('mousedown', e => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          DragMgr.start(item, null, e);
+        });
+        row.addEventListener('click', () => { if (!DragMgr.active) addItem(item); });
+        const thumb = document.createElement('div');
+        thumb.style.cssText = 'width:72px;height:28px;background:#0d1117;border-radius:3px;border:1px solid #30363d;overflow:hidden;flex-shrink:0;position:relative';
+        thumb.setAttribute('data-thumbid', item.id);
+        thumb.appendChild(buildThumb(item));
+        row.appendChild(thumb);
+        const info = document.createElement('div');
+        info.style.cssText = 'flex:1;min-width:0';
+        info.innerHTML = `<div style="font-size:12px;font-weight:500;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.name}</div><div style="font-size:10px;color:#484f58;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.desc}</div>`;
+        row.appendChild(info);
+        const badge = document.createElement('div');
+        badge.style.cssText = 'font-size:10px;color:#484f58;flex-shrink:0;background:#21262d;border-radius:4px;padding:1px 5px';
+        badge.textContent = item.units + 'U';
+        row.appendChild(badge);
+        container.appendChild(row);
+      });
+    }
+  });
+  const addDiv = document.createElement('div');
+  addDiv.style.cssText = 'margin:10px 12px';
+  const addB = document.createElement('button');
+  addB.style.cssText = 'width:100%;padding:8px 12px;background:#161b22;border:1px solid #30363d;border-radius:7px;color:#8b949e;font-size:11px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:6px';
+  addB.textContent = '＋ Eigen component toevoegen';
+  addB.addEventListener('click', () => setState({ showPhoto: true }));
+  addDiv.appendChild(addB);
+  container.appendChild(addDiv);
+}
+
+function buildApp() {
+  const { rack, cables, selectedId, selectedPort, tool, cableColor, zoom, search, brands,
+          showNewRack, showPhoto, photoImg, photoAnalyzing, photoResult,
+          newRackName, newRackU, newRackDepth } = state;
+  const selItem = rack?.items?.find(i => i.id === selectedId);
+  const occ = rack ? getOcc(rack.items) : new Set();
+  const sorted = rack ? [...rack.items].sort((a,b) => a.slot - b.slot) : [];
+  const usedU = rack?.items.reduce((s,x) => s + x.units, 0) || 0;
+  const RAIL = 34;
+
+  const root = el('div', { style: 'display:flex;flex-direction:column;height:100vh;overflow:hidden' });
+
+  // ── TOPBAR ──
+  const topbar = el('div', { style: 'height:52px;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 16px;gap:16px;flex-shrink:0' });
+  const logo = el('div', { style: 'display:flex;align-items:center;gap:10px;width:260px;flex-shrink:0' });
+  const logoIcon = el('div', { style: 'width:32px;height:32px;background:linear-gradient(135deg,#2f81f7,#0d5fd4);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:15px' }, '⬛');
+  const logoText = el('div');
+  logoText.innerHTML = '<div style="font-size:13px;font-weight:700;color:#f0f6fc">RackForge <span style="font-size:10px;background:#2f81f7;border-radius:4px;padding:1px 5px;font-weight:600">v1</span></div><div style="font-size:9px;color:#484f58;letter-spacing:0.5px">VENDOR PATCHKAST DESIGNER</div>';
+  logo.appendChild(logoIcon); logo.appendChild(logoText);
+  topbar.appendChild(logo);
+  [['⊕','Nieuw',()=>setState({showNewRack:true})],['📁','Openen',()=>{}],['💾','Opslaan',()=>{}],['📄','Export PDF',()=>{}],['🖼','Export PNG',()=>{}],['📋','Materiaallijst',()=>{}]].forEach(([icon,label,action]) => {
+    const b = el('button', { style: 'display:flex;flex-direction:column;align-items:center;gap:1px;padding:4px 8px;background:transparent;border:none;border-radius:6px;color:#8b949e;cursor:pointer;min-width:44px', onclick: action });
+    b.appendChild(el('span', { style: 'font-size:13px' }, icon));
+    b.appendChild(el('span', { style: 'font-size:9px;white-space:nowrap' }, label));
+    b.classList.add('tbtn');
+    topbar.appendChild(b);
+  });
+  topbar.appendChild(el('div', { style: 'flex:1' }));
+  [['↩','Ongedaan maken'],['↪','Opnieuw'],['⚙','Instellingen']].forEach(([icon,label]) => {
+    const b = el('button', { style: 'display:flex;flex-direction:column;align-items:center;gap:1px;padding:4px 8px;background:transparent;border:none;border-radius:6px;color:#8b949e;cursor:pointer;min-width:44px' });
+    b.appendChild(el('span', { style: 'font-size:13px' }, icon));
+    b.appendChild(el('span', { style: 'font-size:9px' }, label));
+    if (label === 'Instellingen') b.addEventListener('click', () => setState({ showGithubConfig: true }));
+    b.classList.add('tbtn');
+    topbar.appendChild(b);
+  });
+  root.appendChild(topbar);
+
+  // ── TOOLBAR ──
+  const toolbar = el('div', { style: 'height:40px;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 16px;gap:8px;flex-shrink:0' });
+  const rackSel = el('select', { style: 'background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e2e8f0;padding:3px 8px;font-size:12px' });
+  rackSel.appendChild(el('option', {}, `${rack?.totalU||16}U`));
+  toolbar.appendChild(rackSel);
+  const depthSel = el('select', { style: 'background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e2e8f0;padding:3px 8px;font-size:12px' });
+  depthSel.appendChild(el('option', {}, `${rack?.depth||600}mm diep`));
+  toolbar.appendChild(depthSel);
+  toolbar.appendChild(el('div', { style: 'width:1px;height:24px;background:#30363d' }));
+  [['select','Selecteer'],['move','Verplaats'],['cable','Kabel'],['connect','Verbinding'],['delete','Verwijder']].forEach(([id,label]) => {
+    const active = tool === id;
+    const b = el('button', {
+      style: `padding:4px 14px;border-radius:6px;border:none;background:${active?'#2f81f7':'transparent'};color:${active?'#fff':'#8b949e'};font-size:12px;font-weight:${active?600:400};cursor:pointer`,
+      onclick: () => { setState({ tool: id }); if (id !== 'cable') setState({ selectedPort: null }); }
+    }, label);
+    if (!active) b.classList.add('tbtn');
+    toolbar.appendChild(b);
+  });
+  if (tool === 'cable') {
+    toolbar.appendChild(el('span', { style: 'font-size:11px;color:#484f58;margin-left:4px' }, 'Kleur:'));
+    ['#2563eb','#dc2626','#16a34a','#ca8a04','#7c3aed','#ea580c','#db2777','#e2e8f0'].forEach(c => {
+      const b = el('button', { style: `width:15px;height:15px;border-radius:3px;background:${c};border:${cableColor===c?'2px solid #fff':'2px solid transparent'};cursor:pointer;padding:0`, onclick: () => setState({ cableColor: c }) });
+      toolbar.appendChild(b);
+    });
+  }
+  toolbar.appendChild(el('div', { style: 'flex:1' }));
+  const zm = el('div', { style: 'display:flex;align-items:center;gap:5px' });
+  zm.appendChild(el('button', { style: 'width:22px;height:22px;border:1px solid #30363d;border-radius:5px;background:#21262d;color:#8b949e;cursor:pointer;font-size:13px', onclick: () => setState(s=>({zoom:Math.max(50,s.zoom-10)})) }, '−'));
+  zm.appendChild(el('span', { style: 'font-size:12px;color:#8b949e;width:38px;text-align:center' }, `${zoom}%`));
+  zm.appendChild(el('button', { style: 'width:22px;height:22px;border:1px solid #30363d;border-radius:5px;background:#21262d;color:#8b949e;cursor:pointer;font-size:13px', onclick: () => setState(s=>({zoom:Math.min(200,s.zoom+10)})) }, '+'));
+  zm.appendChild(el('button', { style: 'padding:2px 8px;border:1px solid #30363d;border-radius:5px;background:#21262d;color:#8b949e;cursor:pointer;font-size:11px', onclick: () => setState({zoom:100}) }, '⊡'));
+  toolbar.appendChild(zm);
+  root.appendChild(toolbar);
+
+  const body = el('div', { style: 'display:flex;flex:1;overflow:hidden' });
+
+  // ── LEFT SIDEBAR ──
+  const sidebar = el('div', { style: 'width:272px;background:#161b22;border-right:1px solid #30363d;display:flex;flex-direction:column;flex-shrink:0' });
+  const tabsEl = el('div', { style: 'display:flex;border-bottom:1px solid #30363d;flex-shrink:0' });
+  ['COMPONENTEN','KABELS','FAVORIETEN'].forEach((t,i) => {
+    tabsEl.appendChild(el('button', { style: `flex:1;padding:9px 0;background:transparent;border:none;border-bottom:${i===0?'2px solid #2f81f7':'2px solid transparent'};color:${i===0?'#f0f6fc':'#484f58'};font-size:11px;font-weight:600;cursor:pointer;letter-spacing:0.5px` }, t));
+  });
+  sidebar.appendChild(tabsEl);
+
+  // Search
+  const searchWrap = el('div', { style: 'padding:8px 10px;border-bottom:1px solid #30363d;flex-shrink:0' });
+  const searchInner = el('div', { style: 'display:flex;align-items:center;gap:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:5px 10px' });
+  searchInner.appendChild(el('span', { style: 'color:#484f58;font-size:12px' }, '🔍'));
+  const searchInput = el('input', { style: 'background:transparent;border:none;color:#e2e8f0;font-size:12px;outline:none;flex:1', placeholder: 'Zoek componenten...' });
+  searchInput.id = 'lib-search';
+  searchInput.value = search;
+  if (state._searchFocused) {
+    requestAnimationFrame(() => {
+      const inp = document.getElementById('lib-search');
+      if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+    });
+  }
+  searchInput.addEventListener('focus', () => { state._searchFocused = true; });
+  searchInput.addEventListener('blur',  () => { state._searchFocused = false; });
+  searchInput.addEventListener('input', e => { state.search = e.target.value; renderLibList(); });
+  if (search) {
+    const clr = el('button', { style: 'background:none;border:none;color:#484f58;cursor:pointer;font-size:14px', onclick: () => setState({ search: '' }) }, '×');
+    searchInner.appendChild(clr);
+  }
+  searchInner.appendChild(searchInput);
+  searchWrap.appendChild(searchInner);
+  sidebar.appendChild(searchWrap);
+
+  const libScroll = el('div', { id:'lib-list', style: 'flex:1;overflow-y:auto' });
+  requestAnimationFrame(() => renderLibList());
+  sidebar.appendChild(libScroll);
+  body.appendChild(sidebar);
+
+  // ── RACK CANVAS ──
+  const canvas = el('div', { style: 'flex:1;overflow:auto;background:#0d1117;display:flex;flex-direction:column;align-items:center;padding:24px' });
+  if (tool === 'cable' && selectedPort) {
+    const banner = el('div', { style: 'width:100%;max-width:720px;margin-bottom:10px;padding:8px 14px;background:#1c2333;border:1px solid #2f81f788;border-radius:8px;display:flex;align-items:center;gap:10px' });
+    banner.appendChild(el('div', { style: 'width:7px;height:7px;border-radius:50%;background:#2f81f7' }));
+    banner.appendChild(el('span', { style: 'font-size:12px;color:#79c0ff' }, 'Kabel modus — klik een andere poort om te verbinden'));
+    const cancel = el('button', { style: 'margin-left:auto;padding:3px 10px;background:#da3633;border:none;border-radius:5px;color:#fff;font-size:11px;cursor:pointer', onclick: () => setState({ selectedPort: null }) }, 'Annuleer');
+    banner.appendChild(cancel);
+    canvas.appendChild(banner);
+  }
+  if (rack) {
+    const scaleWrap = el('div', { style: `transform:scale(${zoom/100});transform-origin:top center;transition:transform 0.15s` });
+    scaleWrap.appendChild(el('div', { style: 'margin-bottom:8px;padding-left:4px;font-size:13px;font-weight:600;color:#8b949e' }, `${rack.name} — ${rack.totalU}U / ${rack.depth}mm`));
+    scaleWrap.appendChild(buildRack(rack, sorted, occ, cables, selectedId, selectedPort, tool, RAIL));
+    canvas.appendChild(scaleWrap);
+  }
+  body.appendChild(canvas);
+
+  // ── RIGHT PANEL ──
+  const props = el('div', { style: 'width:240px;background:#161b22;border-left:1px solid #30363d;display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto' });
+  props.appendChild(el('div', { style: 'padding:12px 16px;border-bottom:1px solid #30363d;font-size:11px;font-weight:700;color:#8b949e;letter-spacing:0.5px' }, 'EIGENSCHAPPEN'));
+  if (selItem) {
+    props.appendChild(buildProps(selItem, rack, cables));
+  } else {
+    const ph = el('div', { style: 'padding:16px' });
+    ph.appendChild(el('div', { style: 'font-size:12px;color:#484f58;line-height:1.7;margin-bottom:14px' }, 'Selecteer een component om eigenschappen te zien.'));
+    if (rack) ph.appendChild(buildRackInfo(rack, usedU));
+    props.appendChild(ph);
+  }
+  body.appendChild(props);
+  root.appendChild(body);
+
+  // ── STATUS BAR ──
+  const status = el('div', { style: 'height:26px;background:#161b22;border-top:1px solid #30363d;display:flex;align-items:center;padding:0 16px;gap:20px;flex-shrink:0' });
+  status.innerHTML = `<span style="font-size:10px;color:#484f58">Project: <span style="color:#8b949e">${rack?.name||'—'}</span></span>
+    <span style="font-size:10px;color:#484f58">Rack: <span style="color:#8b949e">${rack?`${rack.totalU}U ${rack.depth}mm`:'—'}</span></span>
+    <div style="display:flex;align-items:center;gap:4px"><div style="width:6px;height:6px;border-radius:50%;background:#22c55e;box-shadow:0 0 4px #22c55e"></div><span style="font-size:10px;color:#484f58">Automatisch opslaan: ingeschakeld</span></div>`;
+  root.appendChild(status);
+
+  if (showNewRack) root.appendChild(buildNewRackModal(newRackName, newRackU, newRackDepth));
+  if (showPhoto) root.appendChild(buildPhotoModal(photoImg, photoAnalyzing, photoResult));
+  if (state.showGithubConfig) root.appendChild(buildGithubModal());
+  return root;
+}
+
+const STENCIL = {
+  patch24: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z M2.14,4.13 L5.11,4.13 C5.39,4.13 5.6,4.49 5.6,5.0 L5.6,5.02 C5.6,5.53 5.39,5.9 5.11,5.9 L2.14,5.9 C1.86,5.9 1.65,5.53 1.65,5.02 L1.65,5.0 C1.65,4.49 1.86,4.13 2.14,4.13 Z M8.41,4.13 L150.42,4.13 C150.51,4.13 150.58,4.23 150.58,4.42 L150.58,6.2 C150.58,6.37 150.51,6.5 150.42,6.5 L8.41,6.5 C8.3,6.5 8.24,6.37 8.24,6.2 L8.24,4.42 C8.24,4.23 8.3,4.13 8.41,4.13 Z M154.37,4.13 L157.33,4.13 C157.62,4.13 157.83,4.49 157.83,5.0 L157.83,5.02 C157.83,5.53 157.62,5.9 157.33,5.9 L154.37,5.9 C154.08,5.9 153.87,5.53 153.87,5.02 L153.87,5.0 C153.87,4.49 154.08,4.13 154.37,4.13 Z M2.14,21.84 L5.11,21.84 C5.39,21.84 5.6,22.21 5.6,22.72 L5.6,22.73 C5.6,23.24 5.39,23.61 5.11,23.61 L2.14,23.61 C1.86,23.61 1.65,23.24 1.65,22.73 L1.65,22.72 C1.65,22.21 1.86,21.84 2.14,21.84 Z M154.37,21.84 L157.33,21.84 C157.62,21.84 157.83,22.21 157.83,22.72 L157.83,22.73 C157.83,23.24 157.62,23.61 157.33,23.61 L154.37,23.61 C154.08,23.61 153.87,23.24 153.87,22.73 L153.87,22.72 C153.87,22.21 154.08,21.84 154.37,21.84 Z" fill="#0d0d0d" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 C0.0,9.34 0.0,18.66 0.0,28.0 L160.0,28.0 L160.0,0.0 Z M0.99,1.76 L159.01,1.76 L159.01,26.24 L0.99,26.24 L0.99,24.37 C1.26,24.98 1.67,25.37 2.14,25.37 L5.11,25.37 C5.92,25.37 6.59,24.19 6.59,22.73 L6.59,22.72 C6.59,21.26 5.92,20.08 5.11,20.08 L2.14,20.08 C1.67,20.08 1.26,20.47 0.99,21.08 L0.99,6.65 C1.26,7.27 1.67,7.65 2.14,7.65 L5.11,7.65 C5.92,7.65 6.59,6.48 6.59,5.02 L6.59,5.0 C6.59,3.55 5.92,2.37 5.11,2.37 L2.14,2.37 C1.67,2.37 1.26,2.76 0.99,3.37 Z M8.41,2.37 C7.78,2.37 7.25,3.3 7.25,4.42 L7.25,6.2 C7.25,7.32 7.78,8.25 8.41,8.25 L150.42,8.25 C151.05,8.25 151.57,7.32 151.57,6.2 L151.57,4.42 C151.57,3.3 151.05,2.37 150.42,2.37 Z M154.37,2.37 C153.56,2.37 152.89,3.55 152.89,5.0 L152.89,5.02 C152.89,6.48 153.56,7.65 154.37,7.65 L157.33,7.65 C158.14,7.65 158.81,6.48 158.81,5.02 L158.81,5.0 C158.81,3.55 158.14,2.37 157.33,2.37 Z M2.14,4.13 L5.11,4.13 C5.39,4.13 5.6,4.49 5.6,5.0 L5.6,5.02 C5.6,5.53 5.39,5.9 5.11,5.9 L2.14,5.9 C1.86,5.9 1.65,5.53 1.65,5.02 L1.65,5.0 C1.65,4.49 1.86,4.13 2.14,4.13 Z M8.41,4.13 L150.42,4.13 C150.51,4.13 150.58,4.23 150.58,4.42 L150.58,6.2 C150.58,6.37 150.51,6.5 150.42,6.5 L8.41,6.5 C8.3,6.5 8.24,6.37 8.24,6.2 L8.24,4.42 C8.24,4.23 8.3,4.13 8.41,4.13 Z M154.37,4.13 L157.33,4.13 C157.62,4.13 157.83,4.49 157.83,5.0 L157.83,5.02 C157.83,5.53 157.62,5.9 157.33,5.9 L154.37,5.9 C154.08,5.9 153.87,5.53 153.87,5.02 L153.87,5.0 C153.87,4.49 154.08,4.13 154.37,4.13 Z M12.69,10.32 L12.69,15.64 L13.68,15.64 L13.68,10.32 Z M18.62,10.32 L18.62,15.64 L19.6,15.64 L19.6,10.32 Z M24.54,10.32 L24.54,15.64 L25.53,15.64 L25.53,10.32 Z M30.81,10.32 L30.81,15.64 L31.8,15.64 L31.8,10.32 Z M36.74,10.32 L36.74,15.64 L37.72,15.64 L37.72,10.32 Z M42.67,10.32 L42.67,15.64 L43.66,15.64 L43.66,10.32 Z M48.6,10.32 L48.6,15.64 L49.59,15.64 L49.59,10.32 Z M54.86,10.32 L54.86,15.64 L55.85,15.64 L55.85,10.32 Z M60.8,10.32 L60.8,15.64 L61.78,15.64 L61.78,10.32 Z M66.39,10.32 L66.39,15.64 L67.39,15.64 L67.39,10.32 Z M72.65,10.32 L72.65,15.64 L73.64,15.64 L73.64,10.32 Z M78.58,10.32 L78.58,15.64 L79.57,15.64 L79.57,10.32 Z M84.52,10.32 L84.52,15.64 L85.51,15.64 L85.51,10.32 Z M90.78,10.32 L90.78,15.64 L91.76,15.64 L91.76,10.32 Z M96.7,10.32 L96.7,15.64 L97.7,15.64 L97.7,10.32 Z M102.64,10.32 L102.64,15.64 L103.63,15.64 L103.63,10.32 Z M108.57,10.32 L108.57,15.64 L109.56,15.64 L109.56,10.32 Z M114.82,10.32 L114.82,15.64 L115.81,15.64 L115.81,10.32 Z M120.76,10.32 L120.76,15.64 L121.75,15.64 L121.75,10.32 Z M126.37,10.32 L126.37,15.64 L127.35,15.64 L127.35,10.32 Z M132.62,10.32 L132.62,15.64 L133.61,15.64 L133.61,10.32 Z M138.55,10.32 L138.55,15.64 L139.54,15.64 L139.54,10.32 Z M144.49,10.32 L144.49,15.64 L145.48,15.64 L145.48,10.32 Z M154.37,20.08 C153.56,20.08 152.89,21.26 152.89,22.72 L152.89,22.73 C152.89,24.19 153.56,25.37 154.37,25.37 L157.33,25.37 C158.14,25.37 158.81,24.19 158.81,22.73 L158.81,22.72 C158.81,21.26 158.14,20.08 157.33,20.08 Z M2.14,21.84 L5.11,21.84 C5.39,21.84 5.6,22.21 5.6,22.72 L5.6,22.73 C5.6,23.24 5.39,23.61 5.11,23.61 L2.14,23.61 C1.86,23.61 1.65,23.24 1.65,22.73 L1.65,22.72 C1.65,22.21 1.86,21.84 2.14,21.84 Z M154.37,21.84 L157.33,21.84 C157.62,21.84 157.83,22.21 157.83,22.72 L157.83,22.73 C157.83,23.24 157.62,23.61 157.33,23.61 L154.37,23.61 C154.08,23.61 153.87,23.24 153.87,22.73 L153.87,22.72 C153.87,22.21 154.08,21.84 154.37,21.84 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  patch48: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 54" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z M2.14,4.11 L5.11,4.11 C5.39,4.11 5.6,4.49 5.6,4.99 L5.6,5.0 C5.6,5.5 5.39,5.88 5.11,5.88 L2.14,5.88 C1.86,5.88 1.65,5.5 1.65,5.0 L1.65,4.99 C1.65,4.49 1.86,4.11 2.14,4.11 Z M8.41,4.11 L150.42,4.11 C150.51,4.11 150.58,4.23 150.58,4.4 L150.58,6.17 C150.58,6.34 150.51,6.47 150.42,6.47 L8.41,6.47 C8.3,6.47 8.24,6.34 8.24,6.17 L8.24,4.4 C8.24,4.23 8.3,4.11 8.41,4.11 Z M154.37,4.11 L157.33,4.11 C157.62,4.11 157.83,4.49 157.83,4.99 L157.83,5.0 C157.83,5.5 157.62,5.88 157.33,5.88 L154.37,5.88 C154.08,5.88 153.87,5.5 153.87,5.0 L153.87,4.99 C153.87,4.49 154.08,4.11 154.37,4.11 Z M8.41,30.27 L150.42,30.27 C150.51,30.27 150.58,30.37 150.58,30.57 L150.58,32.31 C150.58,32.49 150.51,32.61 150.42,32.61 L8.41,32.61 C8.3,32.61 8.24,32.49 8.24,32.31 L8.24,30.57 C8.24,30.37 8.3,30.27 8.41,30.27 Z M2.14,47.89 L5.11,47.89 C5.39,47.89 5.6,48.27 5.6,48.77 C5.6,49.28 5.39,49.65 5.11,49.65 L2.14,49.65 C1.86,49.65 1.65,49.28 1.65,48.77 C1.65,48.27 1.86,47.89 2.14,47.89 Z M154.37,47.89 L157.33,47.89 C157.62,47.89 157.83,48.27 157.83,48.77 C157.83,49.28 157.62,49.65 157.33,49.65 L154.37,49.65 C154.08,49.65 153.87,49.28 153.87,48.77 C153.87,48.27 154.08,47.89 154.37,47.89 Z" fill="#0d0d0d" stroke="#444" stroke-width="0.5"/><path d="M8.07,36.43 L150.42,36.43 L150.42,41.72 L8.07,41.72 Z M8.07,10.29 L150.42,10.29 L150.42,15.57 L8.07,15.57 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 C0.0,18.01 0.0,35.99 0.0,54.0 L160.0,54.0 L160.0,0.0 Z M0.99,1.76 L159.01,1.76 L159.01,52.24 L0.99,52.24 L0.99,50.41 C1.26,51.0 1.67,51.41 2.14,51.41 L5.11,51.41 C5.92,51.41 6.59,50.21 6.59,48.77 C6.59,47.32 5.92,46.12 5.11,46.12 L2.14,46.12 C1.67,46.12 1.26,46.53 0.99,47.13 L0.99,6.62 C1.26,7.24 1.67,7.65 2.14,7.65 L5.11,7.65 C5.92,7.65 6.59,6.45 6.59,5.0 L6.59,4.99 C6.59,3.54 5.92,2.34 5.11,2.34 L2.14,2.34 C1.67,2.34 1.26,2.75 0.99,3.37 Z M8.41,2.34 C7.78,2.34 7.25,3.28 7.25,4.4 L7.25,6.17 C7.25,7.29 7.78,8.23 8.41,8.23 L150.42,8.23 C151.05,8.23 151.57,7.29 151.57,6.17 L151.57,4.4 C151.57,3.28 151.05,2.34 150.42,2.34 Z M154.37,2.34 C153.56,2.34 152.89,3.54 152.89,4.99 L152.89,5.0 C152.89,6.45 153.56,7.65 154.37,7.65 L157.33,7.65 C158.14,7.65 158.81,6.45 158.81,5.0 L158.81,4.99 C158.81,3.54 158.14,2.34 157.33,2.34 Z M2.14,4.11 L5.11,4.11 C5.39,4.11 5.6,4.49 5.6,4.99 L5.6,5.0 C5.6,5.5 5.39,5.88 5.11,5.88 L2.14,5.88 C1.86,5.88 1.65,5.5 1.65,5.0 L1.65,4.99 C1.65,4.49 1.86,4.11 2.14,4.11 Z M8.41,4.11 L150.42,4.11 C150.51,4.11 150.58,4.23 150.58,4.4 L150.58,6.17 C150.58,6.34 150.51,6.47 150.42,6.47 L8.41,6.47 C8.3,6.47 8.24,6.34 8.24,6.17 L8.24,4.4 C8.24,4.23 8.3,4.11 8.41,4.11 Z M154.37,4.11 L157.33,4.11 C157.62,4.11 157.83,4.49 157.83,4.99 L157.83,5.0 C157.83,5.5 157.62,5.88 157.33,5.88 L154.37,5.88 C154.08,5.88 153.87,5.5 153.87,5.0 L153.87,4.99 C153.87,4.49 154.08,4.11 154.37,4.11 Z M12.69,10.29 L12.69,15.57 L13.68,15.57 L13.68,10.29 Z M18.62,10.29 L18.62,15.57 L19.6,15.57 L19.6,10.29 Z M24.54,10.29 L24.54,15.57 L25.53,15.57 L25.53,10.29 Z M30.81,10.29 L30.81,15.57 L31.8,15.57 L31.8,10.29 Z M36.74,10.29 L36.74,15.57 L37.72,15.57 L37.72,10.29 Z M42.67,10.29 L42.67,15.57 L43.66,15.57 L43.66,10.29 Z M48.6,10.29 L48.6,15.57 L49.59,15.57 L49.59,10.29 Z M54.86,10.29 L54.86,15.57 L55.85,15.57 L55.85,10.29 Z M60.8,10.29 L60.8,15.57 L61.78,15.57 L61.78,10.29 Z M66.39,10.29 L66.39,15.57 L67.39,15.57 L67.39,10.29 Z M72.65,10.29 L72.65,15.57 L73.64,15.57 L73.64,10.29 Z M78.58,10.29 L78.58,15.57 L79.57,15.57 L79.57,10.29 Z M84.52,10.29 L84.52,15.57 L85.51,15.57 L85.51,10.29 Z M90.78,10.29 L90.78,15.57 L91.76,15.57 L91.76,10.29 Z M96.7,10.29 L96.7,15.57 L97.7,15.57 L97.7,10.29 Z M102.64,10.29 L102.64,15.57 L103.63,15.57 L103.63,10.29 Z M108.57,10.29 L108.57,15.57 L109.56,15.57 L109.56,10.29 Z M114.82,10.29 L114.82,15.57 L115.81,15.57 L115.81,10.29 Z M120.76,10.29 L120.76,15.57 L121.75,15.57 L121.75,10.29 Z M126.37,10.29 L126.37,15.57 L127.35,15.57 L127.35,10.29 Z M132.62,10.29 L132.62,15.57 L133.61,15.57 L133.61,10.29 Z M138.55,10.29 L138.55,15.57 L139.54,15.57 L139.54,10.29 Z M144.49,10.29 L144.49,15.57 L145.48,15.57 L145.48,10.29 Z M8.41,28.51 C7.78,28.51 7.25,29.44 7.25,30.57 L7.25,32.31 C7.25,33.44 7.78,34.37 8.41,34.37 L150.42,34.37 C151.05,34.37 151.57,33.44 151.57,32.31 L151.57,30.57 C151.57,29.44 151.05,28.51 150.42,28.51 Z M8.41,30.27 L150.42,30.27 C150.51,30.27 150.58,30.37 150.58,30.57 L150.58,32.31 C150.58,32.49 150.51,32.61 150.42,32.61 L8.41,32.61 C8.3,32.61 8.24,32.49 8.24,32.31 L8.24,30.57 C8.24,30.37 8.3,30.27 8.41,30.27 Z M12.69,36.43 L12.69,41.72 L13.68,41.72 L13.68,36.43 Z M18.62,36.43 L18.62,41.72 L19.6,41.72 L19.6,36.43 Z M24.54,36.43 L24.54,41.72 L25.53,41.72 L25.53,36.43 Z M30.81,36.43 L30.81,41.72 L31.8,41.72 L31.8,36.43 Z M36.74,36.43 L36.74,41.72 L37.72,41.72 L37.72,36.43 Z M42.67,36.43 L42.67,41.72 L43.66,41.72 L43.66,36.43 Z M48.6,36.43 L48.6,41.72 L49.59,41.72 L49.59,36.43 Z M54.86,36.43 L54.86,41.72 L55.85,41.72 L55.85,36.43 Z M60.8,36.43 L60.8,41.72 L61.78,41.72 L61.78,36.43 Z M66.39,36.43 L66.39,41.72 L67.39,41.72 L67.39,36.43 Z M72.65,36.43 L72.65,41.72 L73.64,41.72 L73.64,36.43 Z M78.58,36.43 L78.58,41.72 L79.57,41.72 L79.57,36.43 Z M84.52,36.43 L84.52,41.72 L85.51,41.72 L85.51,36.43 Z M90.78,36.43 L90.78,41.72 L91.76,41.72 L91.76,36.43 Z M96.7,36.43 L96.7,41.72 L97.7,41.72 L97.7,36.43 Z M102.64,36.43 L102.64,41.72 L103.63,41.72 L103.63,36.43 Z M108.57,36.43 L108.57,41.72 L109.56,41.72 L109.56,36.43 Z M114.82,36.43 L114.82,41.72 L115.81,41.72 L115.81,36.43 Z M120.76,36.43 L120.76,41.72 L121.75,41.72 L121.75,36.43 Z M126.37,36.43 L126.37,41.72 L127.35,41.72 L127.35,36.43 Z M132.62,36.43 L132.62,41.72 L133.61,41.72 L133.61,36.43 Z M138.55,36.43 L138.55,41.72 L139.54,41.72 L139.54,36.43 Z M144.49,36.43 L144.49,41.72 L145.48,41.72 L145.48,36.43 Z M154.37,46.12 C153.56,46.12 152.89,47.32 152.89,48.77 C152.89,50.21 153.56,51.41 154.37,51.41 L157.33,51.41 C158.14,51.41 158.81,50.21 158.81,48.77 C158.81,47.32 158.14,46.12 157.33,46.12 Z M2.14,47.89 L5.11,47.89 C5.39,47.89 5.6,48.27 5.6,48.77 C5.6,49.28 5.39,49.65 5.11,49.65 L2.14,49.65 C1.86,49.65 1.65,49.28 1.65,48.77 C1.65,48.27 1.86,47.89 2.14,47.89 Z M154.37,47.89 L157.33,47.89 C157.62,47.89 157.83,48.27 157.83,48.77 C157.83,49.28 157.62,49.65 157.33,49.65 L154.37,49.65 C154.08,49.65 153.87,49.28 153.87,48.77 C153.87,48.27 154.08,47.89 154.37,47.89 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  server1u: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z" fill="#1e1e1e" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z M8.73,1.77 L150.91,1.77 L150.91,5.52 C149.68,5.86 148.67,6.76 147.99,8.16 C147.23,9.78 146.86,11.82 146.86,13.88 C146.86,15.92 147.23,17.97 147.99,19.57 C148.67,20.97 149.68,21.9 150.91,22.22 L150.91,26.23 L8.73,26.23 L8.73,22.25 C10.03,22.04 11.11,21.17 11.82,19.73 C12.63,18.12 13.01,15.99 13.01,13.88 C13.01,11.75 12.63,9.63 11.82,8.0 C11.11,6.58 10.03,5.71 8.73,5.48 Z M79.91,4.72 C77.09,4.72 74.8,8.82 74.8,13.88 C74.8,18.92 77.09,23.01 79.91,23.01 C82.72,23.01 85.01,18.92 85.01,13.88 C85.01,8.82 82.72,4.72 79.91,4.72 Z M79.91,6.49 C82.19,6.49 84.03,9.79 84.03,13.88 C84.03,17.96 82.19,21.24 79.91,21.24 C77.62,21.24 75.79,17.96 75.79,13.88 C75.79,9.79 77.62,6.49 79.91,6.49 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M87.81,4.44 L143.16,4.44 L143.16,23.32 L87.81,23.32 Z M17.63,4.44 L72.98,4.44 L72.98,23.32 L17.63,23.32 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  server2u: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 54" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#1e1e1e" stroke="#444" stroke-width="0.5"/><path d="M79.9,19.66 C82.18,19.66 84.02,22.94 84.02,27.0 C84.02,31.06 82.18,34.34 79.9,34.34 C77.62,34.34 75.78,31.06 75.78,27.0 C75.78,22.94 77.62,19.66 79.9,19.66 Z M79.9,17.89 C77.09,17.89 74.8,21.99 74.8,27.0 C74.8,32.03 77.09,36.11 79.9,36.11 C82.71,36.11 85.01,32.03 85.01,27.0 C85.01,21.99 82.71,17.89 79.9,17.89 Z M8.73,1.76 L150.91,1.76 L150.91,18.69 C149.61,18.9 148.53,19.76 147.82,21.19 C147.02,22.8 146.62,24.92 146.62,27.04 C146.62,29.14 147.02,31.25 147.82,32.86 C148.53,34.29 149.61,35.15 150.91,35.36 L150.91,52.24 L8.73,52.24 L8.73,35.36 C10.02,35.15 11.11,34.29 11.81,32.86 C12.62,31.25 13.01,29.14 13.01,27.04 C13.01,24.92 12.62,22.8 11.81,21.19 C11.11,19.76 10.02,18.9 8.73,18.69 Z M0.0,0.0 L0.0,0.88 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M87.8,30.53 L143.16,30.53 L143.16,49.32 L87.8,49.32 Z M17.63,30.53 L72.99,30.53 L72.99,49.32 L17.63,49.32 Z M87.8,4.41 L143.16,4.41 L143.16,23.21 L87.8,23.21 Z M17.63,4.41 L72.99,4.41 L72.99,23.21 L17.63,23.21 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  switch_generic: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 54" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#1a1a1a" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z M0.99,1.76 L159.01,1.76 L159.01,52.24 L0.99,52.24 Z M1.98,5.3 L1.98,24.69 L51.41,24.69 L51.41,5.3 Z M52.39,5.3 L52.39,24.69 L114.67,24.69 L114.67,5.3 Z M2.96,7.06 L50.42,7.06 L50.42,22.93 L2.96,22.93 Z M53.38,7.06 L113.68,7.06 L113.68,22.93 L53.38,22.93 Z M67.21,10.57 L67.21,20.57 L81.71,20.57 L81.71,10.57 Z M84.68,10.57 L84.68,20.57 L99.18,20.57 L99.18,10.57 Z M68.2,12.33 L80.73,12.33 L80.73,18.81 L68.2,18.81 Z M85.67,12.33 L98.19,12.33 L98.19,18.81 L85.67,18.81 Z M1.98,25.87 L1.98,51.11 L157.83,51.11 L157.83,25.87 Z M2.96,27.62 L156.84,27.62 L156.84,49.35 L2.96,49.35 Z M6.26,34.08 L6.26,44.08 L47.45,44.08 L47.45,34.08 Z M51.73,34.08 L51.73,44.08 L92.92,44.08 L92.92,34.08 Z M97.2,34.08 L97.2,44.08 L138.39,44.08 L138.39,34.08 Z M7.25,35.84 L46.46,35.84 L46.46,42.32 L7.25,42.32 Z M52.72,35.84 L91.93,35.84 L91.93,42.32 L52.72,42.32 Z M98.19,35.84 L137.4,35.84 L137.4,42.32 L98.19,42.32 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M98.19,35.84 L137.4,35.84 L137.4,42.32 L98.19,42.32 Z M52.72,35.84 L91.93,35.84 L91.93,42.32 L52.72,42.32 Z M7.25,35.84 L46.46,35.84 L46.46,42.32 L7.25,42.32 Z M1.98,25.87 L1.98,51.11 L157.83,51.11 L157.83,25.87 Z M85.67,12.33 L98.19,12.33 L98.19,18.81 L85.67,18.81 Z M68.2,12.33 L80.73,12.33 L80.73,18.81 L68.2,18.81 Z M7.41,11.45 L7.41,18.51 L46.95,18.51 L46.95,11.45 Z M52.39,5.3 L52.39,24.69 L114.67,24.69 L114.67,5.3 Z M1.98,5.3 L1.98,24.69 L51.41,24.69 L51.41,5.3 Z M0.99,1.76 L159.01,1.76 L159.01,52.24 L0.99,52.24 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  switch_generic2: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 54" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,0.88 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#1a1a1a" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z M0.99,1.77 L159.01,1.77 L159.01,52.23 L0.99,52.23 Z M75.12,4.7 L75.12,22.91 L157.49,22.91 L157.49,4.7 Z M76.11,6.47 L156.51,6.47 L156.51,21.14 L76.11,21.14 Z M128.5,8.81 L128.5,18.79 L142.67,18.79 L142.67,8.81 Z M129.49,10.58 L141.68,10.58 L141.68,17.03 L129.49,17.03 Z M16.15,11.75 L16.15,21.74 L30.31,21.74 L30.31,11.75 Z M17.14,13.51 L29.33,13.51 L29.33,19.98 L17.14,19.98 Z M16.15,33.49 L16.15,43.47 L30.31,43.47 L30.31,33.49 Z M39.87,33.49 L39.87,43.47 L54.03,43.47 L54.03,33.49 Z M63.92,33.49 L63.92,43.47 L78.09,43.47 L78.09,33.49 Z M84.02,33.49 L84.02,43.47 L98.19,43.47 L98.19,33.49 Z M104.12,33.49 L104.12,43.47 L118.29,43.47 L118.29,33.49 Z M128.18,33.49 L128.18,43.47 L142.34,43.47 L142.34,33.49 Z M17.14,35.26 L29.33,35.26 L29.33,41.71 L17.14,41.71 Z M40.85,35.26 L53.04,35.26 L53.04,41.71 L40.85,41.71 Z M64.91,35.26 L77.1,35.26 L77.1,41.71 L64.91,41.71 Z M85.0,35.26 L97.2,35.26 L97.2,41.71 L85.0,41.71 Z M105.11,35.26 L117.3,35.26 L117.3,41.71 L105.11,41.71 Z M129.16,35.26 L141.35,35.26 L141.35,41.71 L129.16,41.71 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M128.18,33.49 L142.34,33.49 L142.34,43.47 L128.18,43.47 L128.18,34.37 Z M104.12,33.49 L118.29,33.49 L118.29,43.47 L104.12,43.47 L104.12,34.37 Z M84.02,33.49 L98.19,33.49 L98.19,43.47 L84.02,43.47 L84.02,34.37 Z M63.92,33.49 L78.09,33.49 L78.09,43.47 L63.92,43.47 L63.92,34.37 Z M39.87,33.49 L54.03,33.49 L54.03,43.47 L39.87,43.47 L39.87,34.37 Z M16.15,33.49 L30.31,33.49 L30.31,43.47 L16.15,43.47 L16.15,34.37 Z M16.15,11.75 L30.31,11.75 L30.31,21.74 L16.15,21.74 L16.15,12.63 Z M128.5,8.81 L142.67,8.81 L142.67,18.79 L128.5,18.79 L128.5,9.7 Z M76.11,6.47 L76.11,21.14 L156.51,21.14 L156.51,6.47 Z M75.12,4.7 L157.49,4.7 L157.49,22.91 L75.12,22.91 L75.12,5.58 Z M0.99,1.77 L0.99,52.23 L159.01,52.23 L159.01,1.77 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M129.16,35.26 L129.16,41.71 L141.35,41.71 L141.35,35.26 Z M105.11,35.26 L105.11,41.71 L117.3,41.71 L117.3,35.26 Z M85.0,35.26 L85.0,41.71 L97.2,41.71 L97.2,35.26 Z M64.91,35.26 L64.91,41.71 L77.1,41.71 L77.1,35.26 Z M40.85,35.26 L40.85,41.71 L53.04,41.71 L53.04,35.26 Z M17.14,35.26 L17.14,41.71 L29.33,41.71 L29.33,35.26 Z M17.14,13.51 L17.14,19.98 L29.33,19.98 L29.33,13.51 Z M129.49,10.58 L129.49,17.03 L141.68,17.03 L141.68,10.58 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  ups_1u: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z" fill="#111" stroke="#444" stroke-width="0.5"/><path d="M115.48,16.22 L142.84,16.22 L142.84,21.54 L115.48,21.54 Z M115.48,6.2 L142.84,6.2 L142.84,11.5 L115.48,11.5 Z M16.31,16.22 L87.8,16.22 L87.8,21.54 L16.31,21.54 Z M16.31,6.2 L87.8,6.2 L87.8,11.5 L16.31,11.5 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,0.88 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z M9.22,2.63 L150.41,2.63 L150.41,4.81 C149.2,5.16 148.14,5.99 147.42,7.43 C146.52,9.22 146.09,11.55 146.09,13.87 C146.09,16.17 146.52,18.5 147.42,20.31 C148.14,21.75 149.2,22.56 150.41,22.91 L150.41,25.37 L9.22,25.37 L9.22,22.91 C10.43,22.56 11.5,21.75 12.22,20.31 C13.12,18.5 13.55,16.17 13.55,13.87 C13.55,11.55 13.12,9.22 12.22,7.43 C11.5,5.99 10.43,5.16 9.22,4.81 Z" fill="#000000" stroke="#000000" stroke-width="0.5"/></svg>`,
+  ups_2u: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 54" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#111" stroke="#444" stroke-width="0.5"/><path d="M8.73,1.76 L150.91,1.76 L150.91,21.2 C150.07,21.41 149.35,21.97 148.88,22.92 C148.32,24.06 148.04,25.53 148.04,27.01 C148.04,28.47 148.32,29.94 148.88,31.08 C149.35,32.03 150.07,32.59 150.91,32.8 L150.91,52.24 L8.73,52.24 L8.73,32.8 C9.57,32.59 10.28,32.03 10.76,31.08 C11.33,29.94 11.6,28.47 11.6,27.01 C11.6,25.53 11.33,24.06 10.76,22.92 C10.28,21.97 9.57,21.41 8.73,21.2 Z M0.0,0.0 L0.0,54.0 L160.0,54.0 L160.0,0.0 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M16.64,45.54 L88.14,45.54 L88.14,49.45 L16.64,49.45 Z M16.64,39.67 L88.14,39.67 L88.14,43.59 L16.64,43.59 Z M16.64,33.79 L88.14,33.79 L88.14,37.7 L16.64,37.7 Z M16.64,28.31 L88.14,28.31 L88.14,32.22 L16.64,32.22 Z M16.64,22.43 L88.14,22.43 L88.14,26.34 L16.64,26.34 Z M16.64,16.54 L88.14,16.54 L88.14,20.46 L16.64,20.46 Z M16.64,11.06 L88.14,11.06 L88.14,14.98 L16.64,14.98 Z M16.64,5.18 L88.14,5.18 L88.14,9.11 L16.64,9.11 Z" fill="#000000" stroke="#000000" stroke-width="0.5"/></svg>`,
+  cisco_router: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z" fill="#111" stroke="#444" stroke-width="0.5"/><path d="M154.25,1.78 L159.01,1.78 L159.01,26.22 L154.25,26.22 Z M0.99,1.78 L5.92,1.78 L5.92,26.22 L0.99,26.22 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,28.0 L5.92,28.0 L154.25,28.0 L160.0,28.0 L160.0,0.0 L154.25,0.0 L5.92,0.0 Z M0.99,1.78 L5.92,1.78 L5.92,26.22 L0.99,26.22 Z M6.91,1.78 L153.26,1.78 L153.26,26.22 L6.91,26.22 Z M154.25,1.78 L159.01,1.78 L159.01,26.22 L154.25,26.22 Z M7.91,3.57 L7.91,16.05 L10.87,16.05 L10.87,23.18 L34.59,23.18 L34.59,16.05 L39.53,16.05 L39.53,23.18 L63.25,23.18 L63.25,16.05 L123.53,16.05 L123.53,3.57 Z M126.5,3.57 L126.5,12.48 L132.43,12.48 L132.43,3.57 Z M141.32,3.57 L141.32,23.18 L147.25,23.18 L147.25,3.57 Z M8.89,5.35 L36.57,5.35 L36.57,14.27 L8.89,14.27 Z M37.55,5.35 L65.23,5.35 L65.23,14.27 L37.55,14.27 Z M66.21,5.35 L93.89,5.35 L93.89,14.27 L66.21,14.27 Z M94.87,5.35 L122.54,5.35 L122.54,14.27 L94.87,14.27 Z M127.49,5.35 L131.44,5.35 L131.44,10.7 L127.49,10.7 Z M142.31,5.35 L146.26,5.35 L146.26,21.4 L142.31,21.4 Z M126.5,14.27 L126.5,23.18 L132.43,23.18 L132.43,14.27 Z M133.42,14.27 L133.42,23.18 L139.35,23.18 L139.35,14.27 Z M11.86,16.05 L33.6,16.05 L33.6,21.4 L11.86,21.4 Z M40.52,16.05 L62.26,16.05 L62.26,21.4 L40.52,21.4 Z M127.49,16.05 L131.44,16.05 L131.44,21.4 L127.49,21.4 Z M134.4,16.05 L138.36,16.05 L138.36,21.4 L134.4,21.4 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  cisco_sw48: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z" fill="#111" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 C0.0,9.34 0.0,18.66 0.0,28.0 L160.0,28.0 L160.0,0.0 Z M0.99,1.77 L5.93,1.77 L5.93,26.23 L0.99,26.23 Z M6.92,1.77 L153.18,1.77 L153.18,26.23 L6.92,26.23 Z M154.17,1.77 L159.01,1.77 L159.01,26.23 L154.17,26.23 Z M10.87,3.54 C10.87,10.9 10.87,18.48 10.87,24.81 L39.53,24.81 C39.53,17.72 39.53,10.63 39.53,3.54 Z M42.5,3.54 C42.5,10.92 42.5,17.12 42.5,24.81 L71.16,24.81 C71.16,17.72 71.16,10.63 71.16,3.54 Z M74.12,3.54 C74.12,10.9 74.12,18.48 74.12,24.81 L102.78,24.81 C102.78,17.72 102.78,10.63 102.78,3.54 Z M105.74,3.54 C105.74,10.9 105.74,18.48 105.74,24.81 L134.4,24.81 C134.4,17.72 134.4,10.63 134.4,3.54 Z M137.37,3.54 C137.37,10.9 137.37,18.48 137.37,24.81 C141.65,24.81 145.94,24.81 150.22,24.81 C150.22,17.72 150.22,10.63 150.22,3.54 C145.94,3.54 141.65,3.54 137.37,3.54 Z M11.86,5.32 L38.54,5.32 L38.54,12.41 L11.86,12.41 Z M43.48,5.32 L70.17,5.32 L70.17,12.41 L43.48,12.41 Z M75.11,5.32 L101.79,5.32 L101.79,12.41 L75.11,12.41 Z M106.73,5.32 L133.42,5.32 L133.42,12.41 L106.73,12.41 Z M138.36,5.32 L143.3,5.32 L143.3,12.41 L138.36,12.41 Z M144.29,5.32 L149.23,5.32 L149.23,12.41 L144.29,12.41 Z M11.86,15.95 L38.54,15.95 L38.54,23.04 L11.86,23.04 Z M43.48,15.95 L70.17,15.95 L70.17,23.04 L43.48,23.04 Z M75.11,15.95 L101.79,15.95 L101.79,23.04 L75.11,23.04 Z M106.73,15.95 L133.42,15.95 L133.42,23.04 L106.73,23.04 Z M138.36,15.95 L143.3,15.95 L143.3,23.04 L138.36,23.04 Z M144.29,15.95 L149.23,15.95 L149.23,23.04 L144.29,23.04 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M154.17,1.77 L159.01,1.77 L159.01,26.23 L154.17,26.23 Z M0.99,1.77 L5.93,1.77 L5.93,26.23 L0.99,26.23 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+  ubiquiti_sw: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 150 1050 170" width="100%" height="100%">
+  <defs>
+    <linearGradient id="body_ubiquiti_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3a3a"/>
+      <stop offset="0.55" stop-color="#252525"/>
+      <stop offset="1" stop-color="#1a1a1a"/>
+    </linearGradient>
+    <linearGradient id="bevel_ubiquiti_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#444"/>
+      <stop offset="1" stop-color="#2a2a2a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top bevel -->
+  <path d="M75 120 L1125 120 L1185 160 L20 160 Z" fill="url(#bevel_ubiquiti_sw)" stroke="#111" stroke-width="2"/>
+  <!-- Main face -->
+  <rect x="20" y="160" width="1165" height="150" rx="4" fill="url(#body_ubiquiti_sw)" stroke="#111" stroke-width="2"/>
+
+  <!-- Front top slot -->
+  <rect x="120" y="166" width="1010" height="4" rx="2" fill="#333" opacity=".75"/>
+
+  <!-- Left status / logo block -->
+  <rect x="40" y="185" width="100" height="62" rx="5" fill="#111" stroke="#111" stroke-width="1.5"/>
+  <circle cx="90" cy="213" r="20" fill="none" stroke="#006fff" stroke-width="4"/>
+               <path d="M78,200 L78,218 Q78,232 90,232 Q102,232 102,218 L102,200" fill="none" stroke="#006fff" stroke-width="3.5" stroke-linecap="round"/>
+               <text x="90" y="244" text-anchor="middle" font-family="Arial" font-size="9" fill="#666">UniFi</text>
+
+  <!-- Ethernet ports group — 12 col × 2 row -->
+  <g transform="translate(155 185)">
+    <rect x="0" y="0" width="940" height="66" rx="2" fill="#111" stroke="#2a2a2a"/>
+    <!-- Divider at midpoint -->
+    <rect x="463" y="0" width="8" height="66" fill="#0a0a0a"/>
+    <!-- Top row: 12 ports -->
+    <path d="M7 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Bottom row: 12 ports -->
+    <path d="M7 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Port LEDs top row -->
+    <rect x="14" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="32" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="92" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="110" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="170" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="188" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="248" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="266" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="326" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="344" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="404" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="422" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="482" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="500" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="578" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="638" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="656" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="716" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="734" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="794" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="812" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="872" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="890" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+  </g>
+
+  <!-- SFP ports right -->
+  <g transform="translate(1112 185)">
+    <rect x="0" y="0" width="50" height="66" rx="2" fill="#111" stroke="#2a2a2a"/>
+    <rect x="5" y="4" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="12" width="34" height="10" rx="1" fill="#006fff"/>
+    <rect x="5" y="36" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="44" width="34" height="10" rx="1" fill="#006fff"/>
+    <text x="25" y="22" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+    <text x="25" y="54" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+  </g>
+
+  <!-- Status LEDs far right -->
+  <circle cx="1178" cy="205" r="6" fill="#22c55e"/>
+  <circle cx="1178" cy="230" r="6" fill="#006fff"/>
+</svg>`,
+  tplink_sw: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 150 1050 170" width="100%" height="100%">
+  <defs>
+    <linearGradient id="body_tplink_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e2e2e"/>
+      <stop offset="0.55" stop-color="#222"/>
+      <stop offset="1" stop-color="#181818"/>
+    </linearGradient>
+    <linearGradient id="bevel_tplink_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3a3a"/>
+      <stop offset="1" stop-color="#252525"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top bevel -->
+  <path d="M75 120 L1125 120 L1185 160 L20 160 Z" fill="url(#bevel_tplink_sw)" stroke="#111" stroke-width="2"/>
+  <!-- Main face -->
+  <rect x="20" y="160" width="1165" height="150" rx="4" fill="url(#body_tplink_sw)" stroke="#111" stroke-width="2"/>
+
+  <!-- Front top slot -->
+  <rect x="120" y="166" width="1010" height="4" rx="2" fill="#333" opacity=".75"/>
+
+  <!-- Left status / logo block -->
+  <rect x="40" y="185" width="100" height="62" rx="5" fill="#111" stroke="#111" stroke-width="1.5"/>
+  <circle cx="90" cy="208" r="18" fill="#4ade80"/>
+               <circle cx="90" cy="208" r="12" fill="#111"/>
+               <circle cx="90" cy="208" r="5" fill="#4ade80"/>
+               <text x="90" y="232" text-anchor="middle" font-family="Arial" font-size="8" fill="#4ade80" font-weight="700">tp-link</text>
+               <text x="90" y="244" text-anchor="middle" font-family="Arial" font-size="7" fill="#555">JetStream</text>
+
+  <!-- Ethernet ports group — 12 col × 2 row -->
+  <g transform="translate(155 185)">
+    <rect x="0" y="0" width="940" height="66" rx="2" fill="#0d0d0d" stroke="#222"/>
+    <!-- Divider at midpoint -->
+    <rect x="463" y="0" width="8" height="66" fill="#080808"/>
+    <!-- Top row: 12 ports -->
+    <path d="M7 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Bottom row: 12 ports -->
+    <path d="M7 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Port LEDs top row -->
+    <rect x="14" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="32" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="92" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="110" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="170" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="188" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="248" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="266" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="326" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="344" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="404" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="422" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="482" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="500" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="578" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="638" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="656" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="716" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="734" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="794" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="812" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="872" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="890" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+  </g>
+
+  <!-- SFP ports right -->
+  <g transform="translate(1112 185)">
+    <rect x="0" y="0" width="50" height="66" rx="2" fill="#0d0d0d" stroke="#222"/>
+    <rect x="5" y="4" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="12" width="34" height="10" rx="1" fill="#4ade80"/>
+    <rect x="5" y="36" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="44" width="34" height="10" rx="1" fill="#4ade80"/>
+    <text x="25" y="22" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+    <text x="25" y="54" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+  </g>
+
+  <!-- Status LEDs far right -->
+  <circle cx="1178" cy="205" r="6" fill="#22c55e"/>
+  <circle cx="1178" cy="230" r="6" fill="#4ade80"/>
+</svg>`,
+  cisco_sw: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 150 1050 170" width="100%" height="100%">
+  <defs>
+    <linearGradient id="body_cisco_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#282828"/>
+      <stop offset="0.55" stop-color="#1c1c1c"/>
+      <stop offset="1" stop-color="#141414"/>
+    </linearGradient>
+    <linearGradient id="bevel_cisco_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#333"/>
+      <stop offset="1" stop-color="#222"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top bevel -->
+  <path d="M75 120 L1125 120 L1185 160 L20 160 Z" fill="url(#bevel_cisco_sw)" stroke="#0a0a0a" stroke-width="2"/>
+  <!-- Main face -->
+  <rect x="20" y="160" width="1165" height="150" rx="4" fill="url(#body_cisco_sw)" stroke="#0a0a0a" stroke-width="2"/>
+
+  <!-- Front top slot -->
+  <rect x="120" y="166" width="1010" height="4" rx="2" fill="#333" opacity=".75"/>
+
+  <!-- Left status / logo block -->
+  <rect x="40" y="185" width="100" height="62" rx="5" fill="#0d0d0d" stroke="#111" stroke-width="1.5"/>
+  <g fill="#fb923c">
+                 <rect x="58" y="193" width="8" height="18" rx="4"/>
+                 <rect x="72" y="186" width="8" height="25" rx="4"/>
+                 <rect x="86" y="182" width="8" height="29" rx="4"/>
+                 <rect x="100" y="186" width="8" height="25" rx="4"/>
+                 <rect x="114" y="193" width="8" height="18" rx="4"/>
+               </g>
+               <text x="90" y="228" text-anchor="middle" font-family="Arial" font-size="10" fill="#fb923c" font-weight="800" letter-spacing="1">CISCO</text>
+               <text x="90" y="244" text-anchor="middle" font-family="Arial" font-size="7.5" fill="#555">Catalyst 2960X</text>
+
+  <!-- Ethernet ports group — 12 col × 2 row -->
+  <g transform="translate(155 185)">
+    <rect x="0" y="0" width="940" height="66" rx="2" fill="#0a0a0a" stroke="#1e1e1e"/>
+    <!-- Divider at midpoint -->
+    <rect x="463" y="0" width="8" height="66" fill="#060606"/>
+    <!-- Top row: 12 ports -->
+    <path d="M7 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Bottom row: 12 ports -->
+    <path d="M7 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Port LEDs top row -->
+    <rect x="14" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="32" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="92" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="110" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="170" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="188" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="248" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="266" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="326" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="344" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="404" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="422" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="482" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="500" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="578" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="638" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="656" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="716" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="734" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="794" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="812" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="872" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="890" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+  </g>
+
+  <!-- SFP ports right -->
+  <g transform="translate(1112 185)">
+    <rect x="0" y="0" width="50" height="66" rx="2" fill="#0a0a0a" stroke="#1e1e1e"/>
+    <rect x="5" y="4" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="12" width="34" height="10" rx="1" fill="#fb923c"/>
+    <rect x="5" y="36" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="44" width="34" height="10" rx="1" fill="#fb923c"/>
+    <text x="25" y="22" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+    <text x="25" y="54" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+  </g>
+
+  <!-- Status LEDs far right -->
+  <circle cx="1178" cy="205" r="6" fill="#22c55e"/>
+  <circle cx="1178" cy="230" r="6" fill="#fb923c"/>
+</svg>`,
+  hp_sw: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 150 1050 170" width="100%" height="100%">
+  <defs>
+    <linearGradient id="body_hp_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e1e2e"/>
+      <stop offset="0.55" stop-color="#161622"/>
+      <stop offset="1" stop-color="#111118"/>
+    </linearGradient>
+    <linearGradient id="bevel_hp_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2a3a"/>
+      <stop offset="1" stop-color="#1a1a28"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top bevel -->
+  <path d="M75 120 L1125 120 L1185 160 L20 160 Z" fill="url(#bevel_hp_sw)" stroke="#0a0a14" stroke-width="2"/>
+  <!-- Main face -->
+  <rect x="20" y="160" width="1165" height="150" rx="4" fill="url(#body_hp_sw)" stroke="#0a0a14" stroke-width="2"/>
+
+  <!-- Front top slot -->
+  <rect x="120" y="166" width="1010" height="4" rx="2" fill="#333" opacity=".75"/>
+
+  <!-- Left status / logo block -->
+  <rect x="40" y="185" width="100" height="62" rx="5" fill="#0d0d1a" stroke="#111" stroke-width="1.5"/>
+  <text x="90" y="210" text-anchor="middle" font-family="Arial" font-size="18" fill="#06b6d4" font-weight="900">HPE</text>
+               <text x="90" y="228" text-anchor="middle" font-family="Arial" font-size="10" fill="#0891b2" font-weight="700">Aruba</text>
+               <text x="90" y="244" text-anchor="middle" font-family="Arial" font-size="7.5" fill="#444">2530-24G</text>
+
+  <!-- Ethernet ports group — 12 col × 2 row -->
+  <g transform="translate(155 185)">
+    <rect x="0" y="0" width="940" height="66" rx="2" fill="#0a0a14" stroke="#1a1a28"/>
+    <!-- Divider at midpoint -->
+    <rect x="463" y="0" width="8" height="66" fill="#060610"/>
+    <!-- Top row: 12 ports -->
+    <path d="M7 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Bottom row: 12 ports -->
+    <path d="M7 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Port LEDs top row -->
+    <rect x="14" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="32" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="92" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="110" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="170" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="188" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="248" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="266" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="326" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="344" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="404" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="422" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="482" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="500" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="578" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="638" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="656" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="716" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="734" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="794" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="812" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="872" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="890" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+  </g>
+
+  <!-- SFP ports right -->
+  <g transform="translate(1112 185)">
+    <rect x="0" y="0" width="50" height="66" rx="2" fill="#0a0a14" stroke="#1a1a28"/>
+    <rect x="5" y="4" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="12" width="34" height="10" rx="1" fill="#06b6d4"/>
+    <rect x="5" y="36" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="44" width="34" height="10" rx="1" fill="#06b6d4"/>
+    <text x="25" y="22" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+    <text x="25" y="54" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+  </g>
+
+  <!-- Status LEDs far right -->
+  <circle cx="1178" cy="205" r="6" fill="#22c55e"/>
+  <circle cx="1178" cy="230" r="6" fill="#06b6d4"/>
+</svg>`,
+  generic_sw: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 150 1050 170" width="100%" height="100%">
+  <defs>
+    <linearGradient id="body_generic_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9dcdd"/>
+      <stop offset="0.55" stop-color="#c5c9ca"/>
+      <stop offset="1" stop-color="#e7e9e9"/>
+    </linearGradient>
+    <linearGradient id="bevel_generic_sw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bfc3c4"/>
+      <stop offset="1" stop-color="#d8dbdc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Top bevel -->
+  <path d="M75 120 L1125 120 L1185 160 L20 160 Z" fill="url(#bevel_generic_sw)" stroke="#9ea3a4" stroke-width="2"/>
+  <!-- Main face -->
+  <rect x="20" y="160" width="1165" height="150" rx="4" fill="url(#body_generic_sw)" stroke="#9ea3a4" stroke-width="2"/>
+
+  <!-- Front top slot -->
+  <rect x="120" y="166" width="1010" height="4" rx="2" fill="#333" opacity=".75"/>
+
+  <!-- Left status / logo block -->
+  <rect x="40" y="185" width="100" height="62" rx="5" fill="#24282c" stroke="#111" stroke-width="1.5"/>
+  <circle cx="57" cy="202" r="7" fill="#5a9cff"/>
+               <circle cx="86" cy="202" r="7" fill="#5a9cff"/>
+               <circle cx="57" cy="232" r="7" fill="#5a9cff"/>
+               <circle cx="86" cy="232" r="7" fill="#5a9cff"/>
+
+  <!-- Ethernet ports group — 12 col × 2 row -->
+  <g transform="translate(155 185)">
+    <rect x="0" y="0" width="940" height="66" rx="2" fill="#f0f1f1" stroke="#8f9495"/>
+    <!-- Divider at midpoint -->
+    <rect x="463" y="0" width="8" height="66" fill="#cfd3d4"/>
+    <!-- Top row: 12 ports -->
+    <path d="M7 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 7 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Bottom row: 12 ports -->
+    <path d="M7 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M85 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M163 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M241 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M319 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M397 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M475 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M553 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M631 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M709 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M787 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <path d="M865 43 h30 v8 h4 v20 h-38 v-20 h4z" fill="#111" stroke="#2a2a2a" stroke-width="1"/>
+    <!-- Port LEDs top row -->
+    <rect x="14" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="32" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="92" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="110" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="170" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="188" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="248" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="266" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="326" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="344" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="404" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="422" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="482" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="500" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="578" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="638" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="656" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="716" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="734" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+    <rect x="794" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.9"/>
+    <rect x="812" y="2" width="8" height="4" rx="1" fill="#1a1a1a" opacity="0.7"/>
+    <rect x="872" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.9"/>
+    <rect x="890" y="2" width="8" height="4" rx="1" fill="#22c55e" opacity="0.7"/>
+  </g>
+
+  <!-- SFP ports right -->
+  <g transform="translate(1112 185)">
+    <rect x="0" y="0" width="50" height="66" rx="2" fill="#f0f1f1" stroke="#8f9495"/>
+    <rect x="5" y="4" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="12" width="34" height="10" rx="1" fill="#9ea3a4"/>
+    <rect x="5" y="36" width="40" height="26" rx="1" fill="#1a1a1a" stroke="#333" stroke-width="0.5"/>
+    <rect x="8" y="44" width="34" height="10" rx="1" fill="#9ea3a4"/>
+    <text x="25" y="22" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+    <text x="25" y="54" text-anchor="middle" font-family="Arial" font-size="9" fill="#555">SFP</text>
+  </g>
+
+  <!-- Status LEDs far right -->
+  <circle cx="1178" cy="205" r="6" fill="#22c55e"/>
+  <circle cx="1178" cy="230" r="6" fill="#5a9cff"/>
+</svg>`,
+  cisco_sw24: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%" style="display:block"><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z" fill="#111" stroke="#444" stroke-width="0.5"/><path d="M0.0,0.0 L0.0,28.0 L160.0,28.0 L160.0,0.0 Z M0.99,1.78 L5.92,1.78 L5.92,26.22 L0.99,26.22 Z M6.91,1.78 L153.26,1.78 L153.26,26.22 L6.91,26.22 Z M154.25,1.78 L159.01,1.78 L159.01,26.22 L154.25,26.22 Z M19.77,3.57 L19.77,10.7 L26.68,10.7 L26.68,3.57 Z M34.59,3.57 L34.59,10.7 L41.51,10.7 L41.51,3.57 Z M49.41,3.57 L49.41,10.7 L56.33,10.7 L56.33,3.57 Z M64.24,3.57 L64.24,10.7 L71.16,10.7 L71.16,3.57 Z M93.89,3.57 L93.89,10.7 L100.8,10.7 L100.8,3.57 Z M108.71,3.57 L108.71,10.7 L115.63,10.7 L115.63,3.57 Z M123.53,3.57 L123.53,10.7 L130.45,10.7 L130.45,3.57 Z M138.36,3.57 L138.36,10.7 L145.27,10.7 L145.27,3.57 Z M20.75,5.35 L25.69,5.35 L25.69,8.92 L20.75,8.92 Z M35.58,5.35 L40.52,5.35 L40.52,8.92 L35.58,8.92 Z M50.4,5.35 L55.34,5.35 L55.34,8.92 L50.4,8.92 Z M65.23,5.35 L70.17,5.35 L70.17,8.92 L65.23,8.92 Z M94.87,5.35 L99.81,5.35 L99.81,8.92 L94.87,8.92 Z M109.7,5.35 L114.64,5.35 L114.64,8.92 L109.7,8.92 Z M124.52,5.35 L129.46,5.35 L129.46,8.92 L124.52,8.92 Z M139.35,5.35 L144.29,5.35 L144.29,8.92 L139.35,8.92 Z M19.77,14.27 L19.77,21.4 L26.68,21.4 L26.68,14.27 Z M34.59,14.27 L34.59,21.4 L41.51,21.4 L41.51,14.27 Z M49.41,14.27 L49.41,21.4 L56.33,21.4 L56.33,14.27 Z M64.24,14.27 L64.24,21.4 L71.16,21.4 L71.16,14.27 Z M93.89,14.27 L93.89,21.4 L100.8,21.4 L100.8,14.27 Z M108.71,14.27 L108.71,21.4 L115.63,21.4 L115.63,14.27 Z M123.53,14.27 L123.53,21.4 L130.45,21.4 L130.45,14.27 Z M138.36,14.27 L138.36,21.4 L145.27,21.4 L145.27,14.27 Z M20.75,16.05 L25.69,16.05 L25.69,19.62 L20.75,19.62 Z M35.58,16.05 L40.52,16.05 L40.52,19.62 L35.58,19.62 Z M50.4,16.05 L55.34,16.05 L55.34,19.62 L50.4,19.62 Z M65.23,16.05 L70.17,16.05 L70.17,19.62 L65.23,19.62 Z M94.87,16.05 L99.81,16.05 L99.81,19.62 L94.87,19.62 Z M109.7,16.05 L114.64,16.05 L114.64,19.62 L109.7,19.62 Z M124.52,16.05 L129.46,16.05 L129.46,19.62 L124.52,19.62 Z M139.35,16.05 L144.29,16.05 L144.29,19.62 L139.35,19.62 Z" fill="#000000" stroke="#444" stroke-width="0.5"/><path d="M74.12,4.46 L90.92,4.46 C92.02,4.46 92.9,6.05 92.9,8.03 L92.9,18.73 C92.9,20.71 92.02,22.29 90.92,22.29 L74.12,22.29 C73.02,22.29 72.14,20.71 72.14,18.73 L72.14,8.03 C72.14,6.05 73.02,4.46 74.12,4.46 Z M148.24,4.46 L150.22,4.46 C151.31,4.46 152.19,6.05 152.19,8.03 L152.19,18.73 C152.19,20.71 151.31,22.29 150.22,22.29 L148.24,22.29 C147.14,22.29 146.26,20.71 146.26,18.73 L146.26,8.03 C146.26,6.05 147.14,4.46 148.24,4.46 Z M133.42,4.46 L135.39,4.46 C136.49,4.46 137.37,6.05 137.37,8.03 L137.37,18.73 C137.37,20.71 136.49,22.29 135.39,22.29 L133.42,22.29 C132.32,22.29 131.44,20.71 131.44,18.73 L131.44,8.03 C131.44,6.05 132.32,4.46 133.42,4.46 Z M118.59,4.46 L120.57,4.46 C121.67,4.46 122.54,6.05 122.54,8.03 L122.54,18.73 C122.54,20.71 121.67,22.29 120.57,22.29 L118.59,22.29 C117.49,22.29 116.62,20.71 116.62,18.73 L116.62,8.03 C116.62,6.05 117.49,4.46 118.59,4.46 Z M103.77,4.46 L105.74,4.46 C106.84,4.46 107.72,6.05 107.72,8.03 L107.72,18.73 C107.72,20.71 106.84,22.29 105.74,22.29 L103.77,22.29 C102.67,22.29 101.79,20.71 101.79,18.73 L101.79,8.03 C101.79,6.05 102.67,4.46 103.77,4.46 Z M59.3,4.46 L61.27,4.46 C62.37,4.46 63.25,6.05 63.25,8.03 L63.25,18.73 C63.25,20.71 62.37,22.29 61.27,22.29 L59.3,22.29 C58.2,22.29 57.32,20.71 57.32,18.73 L57.32,8.03 C57.32,6.05 58.2,4.46 59.3,4.46 Z M44.47,4.46 L46.45,4.46 C47.55,4.46 48.42,6.05 48.42,8.03 L48.42,18.73 C48.42,20.71 47.55,22.29 46.45,22.29 L44.47,22.29 C43.37,22.29 42.5,20.71 42.5,18.73 L42.5,8.03 C42.5,6.05 43.37,4.46 44.47,4.46 Z M29.65,4.46 L31.62,4.46 C32.72,4.46 33.6,6.05 33.6,8.03 L33.6,18.73 C33.6,20.71 32.72,22.29 31.62,22.29 L29.65,22.29 C28.55,22.29 27.67,20.71 27.67,18.73 L27.67,8.03 C27.67,6.05 28.55,4.46 29.65,4.46 Z M14.82,4.46 L16.8,4.46 C17.9,4.46 18.78,6.05 18.78,8.03 L18.78,18.73 C18.78,20.71 17.9,22.29 16.8,22.29 L14.82,22.29 C13.73,22.29 12.85,20.71 12.85,18.73 L12.85,8.03 C12.85,6.05 13.73,4.46 14.82,4.46 Z M154.25,1.78 L159.01,1.78 L159.01,26.22 L154.25,26.22 Z M0.99,1.78 L5.92,1.78 L5.92,26.22 L0.99,26.22 Z" fill="#000000" stroke="#444" stroke-width="0.5"/></svg>`,
+};
+
+// ── GitHub Device Image Loader ────────────────────────────────────────────────
+const GITHUB_IMAGE_REPO = {
+  owner: 'BryBar5503',
+  repo: 'Rackforge',
+  branch: 'main',
+  folder: 'images',  // subfolder in the repo
+};
+
+// Base URLs to try (in order)
+function getImageUrl(filename) {
+  // raw.githubusercontent.com works immediately, no Pages needed
+  return `https://raw.githubusercontent.com/${GITHUB_IMAGE_REPO.owner}/${GITHUB_IMAGE_REPO.repo}/${GITHUB_IMAGE_REPO.branch}/${GITHUB_IMAGE_REPO.folder}/${filename}`;
+}
+
+// Cache: filename (without ext) -> base64 data URL
+const deviceImageCache = {};
+let githubImagesLoaded = false;
+let githubLoadPromise = null;
+
+// Map device model names to likely filenames
+function modelToFilename(item) {
+  // Try exact model name first, then variations
+  const candidates = [
+    item.id,
+    item.name,
+    item.name?.replace(/[^a-zA-Z0-9-]/g, '-'),
+    item.name?.toUpperCase(),
+    item.name?.toUpperCase().replace(/[^A-Z0-9-]/g, '-'),
+  ].filter(Boolean);
+  return candidates;
+}
+
+async function loadGithubImages() {
+  if (githubImagesLoaded) return;
+  if (githubLoadPromise) return githubLoadPromise;
+
+  githubLoadPromise = (async () => {
+    try {
+      // List files in the images/ folder via GitHub API
+      const apiUrl = `https://api.github.com/repos/${GITHUB_IMAGE_REPO.owner}/${GITHUB_IMAGE_REPO.repo}/contents/${GITHUB_IMAGE_REPO.folder}?ref=${GITHUB_IMAGE_REPO.branch}`;
+      const res = await fetch(apiUrl);
+      if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+      const files = await res.json();
+
+      const imageFiles = files.filter(f =>
+        f.type === 'file' && /\.(png|jpg|jpeg|webp|svg)$/i.test(f.name)
+      );
+
+      console.log(`Found ${imageFiles.length} images in GitHub repo`);
+
+      // Store direct URLs (no need to download — browser can load them directly)
+      imageFiles.forEach(file => {
+        const key = file.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9-]/g, '-');
+        const rawUrl = getImageUrl(file.name);
+        deviceImageCache[key] = rawUrl;
+        // Also store original filename without extension
+        const origKey = file.name.replace(/\.[^.]+$/, '').toLowerCase();
+        deviceImageCache[origKey] = rawUrl;
+      });
+
+      githubImagesLoaded = true;
+      console.log(`✓ Mapped ${Object.keys(deviceImageCache).length} device images from GitHub`);
+      render();
+    } catch(e) {
+      console.warn('GitHub image load failed:', e.message);
+      githubImagesLoaded = true; // don't retry
+    }
+  })();
+  return githubLoadPromise;
+}
+
+function getDeviceImage(item) {
+  // Trigger load if not started
+  if (!githubImagesLoaded) { loadGithubImages(); return null; }
+
+  // Build candidate keys from item properties
+  const raw = [
+    item.name, item.id, item.modelName,
+    item.brandName ? `${item.brandName}-${item.name}` : null,
+  ].filter(Boolean);
+
+  const candidates = raw.map(s =>
+    s.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g,'')
+  );
+
+  // 1. Exact match
+  for (const c of candidates) {
+    if (deviceImageCache[c]) return deviceImageCache[c];
+  }
+
+  // 2. Fuzzy: any cached key that contains or is contained by a candidate
+  const cacheKeys = Object.keys(deviceImageCache);
+  for (const c of candidates) {
+    if (c.length < 3) continue;
+    const match = cacheKeys.find(k => k.includes(c) || c.includes(k));
+    if (match) return deviceImageCache[match];
+  }
+
+  return null;
+}
+
+// Start loading when page loads
+document.addEventListener('DOMContentLoaded', () => {
+  if (GITHUB_IMAGE_REPO.owner) loadGithubImages();
+});
+
+function buildThumb(item) {
+  const wrap = el('div', { style: 'position:absolute;inset:0;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#0d1117' });
+
+  // ── Try GitHub image first ──
+  const ghUrl = getDeviceImage(item);
+  if (ghUrl) {
+    const img = document.createElement('img');
+    img.src = ghUrl;
+    img.style.cssText = 'width:100%;height:100%;object-fit:contain;object-position:center;display:block;background:#1a1a1a;';
+    img.onerror = () => { img.style.display='none'; };
+    wrap.appendChild(img);
+    if (ghUrl) return wrap; // return even if img might fail — it'll hide itself
+  }
+
+  // ── Try auto-fetched image ──
+  const cached = imageCache[item.id];
+  if (cached && cached.url) {
+    const img = document.createElement('img');
+    img.src = cached.url;
+    img.style.cssText = 'width:100%;height:100%;object-fit:cover;object-position:left center;display:block;';
+    img.onerror = () => { img.remove(); };
+    wrap.appendChild(img);
+    return wrap;
+  }
+  if (cached && cached.loading) {
+    wrap.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#484f58;font-size:9px">⏳</div>';
+    return wrap;
+  }
+
+  // ── Fallback to SVG stencil ──
+  let svg = '';
+
+  if (item.cat === 'patch' && item.portType === 'fiber') {
+    svg = STENCIL.patch24;
+  } else if (item.cat === 'patch' && item.ports > 36) {
+    svg = STENCIL.patch48;
+  } else if (item.cat === 'patch') {
+    svg = STENCIL.patch24;
+  } else if (item.cat === 'server' && item.units > 1) {
+    svg = STENCIL.server2u;
+  } else if (item.cat === 'server') {
+    svg = STENCIL.server1u;
+  } else if (item.cat === 'ups') {
+    svg = STENCIL.ups_2u;
+  } else if (item.cat === 'power') {
+    svg = STENCIL.ups_1u;
+  } else if (item.vendor === 'cisco' && item.cat === 'router') {
+    svg = STENCIL.cisco_router;
+  } else if (item.vendor === 'cisco') {
+    svg = STENCIL.cisco_sw;
+  } else if (item.vendor === 'ubiquiti') {
+    svg = STENCIL.ubiquiti_sw;
+  } else if (item.vendor === 'tplink') {
+    svg = STENCIL.tplink_sw;
+  } else if (item.vendor === 'hp') {
+    svg = STENCIL.hp_sw;
+  } else if (item.cat === 'switch' || item.cat === 'router') {
+    svg = STENCIL.generic_sw;
+  } else if (item.cat === 'cable') {
+    svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%"><rect width="160" height="28" fill="#0d0d0d"/><text x="12" y="12" font-size="5" fill="#333" font-family="sans-serif" font-weight="700">CABLE</text><text x="12" y="20" font-size="5" fill="#333" font-family="sans-serif" font-weight="700">MGMT</text>${[0,1,2,3,4,5,6].map(i=>`<circle cx="${46+i*16}" cy="14" r="8" fill="none" stroke="#1e1e1e" stroke-width="2.5"/><circle cx="${46+i*16}" cy="14" r="4" fill="none" stroke="#181818" stroke-width="1.5"/>`).join('')}</svg>`;
+  } else if (item.cat === 'filler') {
+    svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 28" width="100%" height="100%"><rect width="160" height="28" fill="#111"/><rect x="0" y="0" width="160" height="1" fill="#1e1e1e"/>${Array.from({length:9},(_,i)=>`<rect x="${8+i*17}" y="10" width="13" height="8" rx="1" fill="#141414" stroke="#1a1a1a" stroke-width="0.4"/>`).join('')}</svg>`;
+  } else {
+    svg = STENCIL.generic_sw;
+  }
+
+  wrap.innerHTML = svg;
+  return wrap;
+}
+
+
+// ── Auto Device Image System ──────────────────────────────────────────────────
+const imageCache = {};     // itemId -> { url, loading, error }
+const pendingFetches = {}; // itemId -> true (prevent duplicate fetches)
+
+async function fetchDeviceImage(item) {
+  const key = item.id;
+  if (imageCache[key] || pendingFetches[key]) return;
+  pendingFetches[key] = true;
+  imageCache[key] = { loading: true };
+  // Show spinner immediately
+  const thumbEl = document.querySelector(`[data-thumbid="${key}"]`);
+  if (thumbEl) thumbEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#484f58;font-size:9px">⏳</div>';
+
+  try {
+    const brand = item.brandName || item.brand || item.vendor || '';
+    const model = item.name || item.id;
+    const query = `${brand} ${model} front panel product image`.trim();
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 500,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{
+          role: 'user',
+          content: `Search for the official product image of: "${brand} ${model}" network device.
+I need a direct URL to a PNG/JPG/WEBP image file showing the front panel of this device.
+Look on the official vendor website, product pages, or press images.
+Return ONLY this JSON (no other text):
+{"url":"DIRECT_IMAGE_URL_HERE"}
+The URL must end in .png, .jpg, .jpeg, or .webp and must be a real direct image link.`
+        }]
+      })
+    });
+
+    const data = await res.json();
+
+    // Walk through all content blocks to find a URL
+    let foundUrl = null;
+    for (const block of (data.content || [])) {
+      if (block.type === 'text') {
+        // Try JSON parse
+        try {
+          const clean = block.text.replace(/```json|```/g,'').trim();
+          const parsed = JSON.parse(clean);
+          if (parsed.url) { foundUrl = parsed.url; break; }
+        } catch(e) {}
+        // Try regex for any direct image URL
+        const matches = block.text.match(/https?:\/\/[^\s"'<>]+\.(png|jpg|jpeg|webp)/gi);
+        if (matches && matches.length > 0) { foundUrl = matches[0]; break; }
+      }
+    }
+
+    if (foundUrl) {
+      imageCache[key] = { url: foundUrl, loading: false };
+      delete pendingFetches[key];
+      render();
+      return;
+    }
+
+    imageCache[key] = { error: true, loading: false };
+  } catch(e) {
+    console.warn('Image fetch failed for', item.name, e);
+    imageCache[key] = { error: true, loading: false };
+  }
+  delete pendingFetches[key];
+  render();
+}
+
+function getItemImage(item) {
+  const cached = imageCache[item.id];
+  if (!cached) return null;
+  if (cached.loading) return 'loading';
+  if (cached.url) return cached.url;
+  return null;
+}
+
+// Render device face using real photo if available
+function renderDeviceFaceWithImage(item, cables, selectedPort, onPortClick) {
+  const imgUrl = getItemImage(item);
+
+  if (imgUrl && imgUrl !== 'loading') {
+    const h = item.units * U - 2;
+    const wrap = document.createElement('div');
+    wrap.style.cssText = `height:${h}px;position:relative;overflow:hidden;background:#111;`;
+
+    // The actual photo — fitted to height, cropped width
+    const img = document.createElement('img');
+    img.src = imgUrl;
+    img.style.cssText = 'height:100%;width:100%;object-fit:cover;object-position:left center;display:block;';
+    img.onerror = () => {
+      // Image failed to load — fall back to SVG
+      imageCache[item.id] = { error: true };
+      render();
+    };
+    wrap.appendChild(img);
+
+    // Dark overlay with port buttons on top so cables still work
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,0) 60%,rgba(0,0,0,0.4) 100%);pointer-events:none;';
+    wrap.appendChild(overlay);
+
+    // Port hit areas (invisible buttons over the image for cable connections)
+    if (item.portObjects && item.portObjects.length > 0) {
+      const portLayer = document.createElement('div');
+      portLayer.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;pointer-events:none;';
+
+      // Estimate port area: starts ~15% from left, ends ~85% from left
+      const portArea = document.createElement('div');
+      portArea.style.cssText = 'position:absolute;left:15%;right:20%;top:10%;bottom:10%;display:flex;flex-wrap:wrap;gap:2px;align-content:center;pointer-events:all;opacity:0;';
+      portArea.style.transition = 'opacity 0.2s';
+
+      item.portObjects.forEach(port => {
+        const cable = cables.find(c => c.fromPortId === port.id || c.toPortId === port.id);
+        const sel = selectedPort?.portId === port.id;
+        const btn = document.createElement('button');
+        btn.setAttribute('data-portid', port.id);
+        btn.title = `Poort ${port.number}${cable ? ' · verbonden' : ''}`;
+        const col = cable ? cable.color : sel ? '#ffd700' : 'rgba(255,255,255,0.3)';
+        btn.style.cssText = `width:14px;height:14px;border:2px solid ${col};border-radius:2px;background:${cable ? col + '88' : 'transparent'};cursor:pointer;padding:0;flex-shrink:0;box-shadow:${cable ? `0 0 6px ${col}` : 'none'};`;
+        btn.addEventListener('click', e => { e.stopPropagation(); handlePortClick(item.id, port.id); });
+        portArea.appendChild(btn);
+      });
+
+      portLayer.appendChild(portArea);
+      wrap.appendChild(portLayer);
+
+      // Show port overlay on hover
+      wrap.addEventListener('mouseenter', () => portArea.style.opacity = '1');
+      wrap.addEventListener('mouseleave', () => portArea.style.opacity = '0');
+    }
+
+    return wrap;
+  }
+
+  // No image yet — trigger fetch and show SVG in the meantime
+  if (!imageCache[item.id] && !pendingFetches[item.id]) {
+    fetchDeviceImage(item);
+  }
+
+  return renderDeviceFace(item, cables, selectedPort, onPortClick);
+}
+
+function buildRack(rack, sorted, occ, cables, selectedId, selectedPort, tool, RAIL) {
+  const wrap = el('div', { style: `width:700px;background:linear-gradient(180deg,#c0c0c0 0%,#d4d4d4 2%,#d4d4d4 98%,#b0b0b0 100%);border:3px solid #a0a0a0;border-radius:5px;box-shadow:0 10px 40px rgba(0,0,0,0.8),inset 0 2px 4px rgba(255,255,255,0.45),inset 0 -2px 4px rgba(0,0,0,0.25);padding:16px;padding-top:20px;padding-bottom:20px;position:relative` });
+  // Top bar
+  const topB = el('div', { style: 'position:absolute;top:0;left:0;right:0;height:20px;background:linear-gradient(180deg,#b0b0b0,#c8c8c8);border-bottom:2px solid #a0a0a0;display:flex;align-items:center;justify-content:space-between;padding:0 18px' });
+  const slots = el('div', { style: 'display:flex;gap:3px' });
+  for (let i = 0; i < 16; i++) slots.appendChild(el('div', { style: 'width:10px;height:7px;background:#888;border-radius:1px;box-shadow:inset 0 1px 2px rgba(0,0,0,0.5)' }));
+  topB.appendChild(slots);
+  const dots = el('div', { style: 'display:flex;gap:3px' });
+  for (let i = 0; i < 3; i++) dots.appendChild(el('div', { style: 'width:9px;height:9px;border-radius:50%;border:1px solid #999;background:#bbb' }));
+  topB.appendChild(dots);
+  wrap.appendChild(topB);
+  // Bottom bar
+  const botB = el('div', { style: 'position:absolute;bottom:0;left:0;right:0;height:20px;background:linear-gradient(0deg,#b0b0b0,#c8c8c8);border-top:2px solid #a0a0a0;display:flex;align-items:center;padding:0 20px;gap:14px' });
+  for (let i = 0; i < 5; i++) botB.appendChild(el('div', { style: 'width:30px;height:10px;background:#888;border-radius:50%;box-shadow:inset 0 2px 4px rgba(0,0,0,0.5)' }));
+  wrap.appendChild(botB);
+  // Side vents
+  ['left','right'].forEach(side => {
+    const vent = el('div', { style: `position:absolute;top:20px;bottom:20px;${side}:0;width:16px;background:${side==='left'?'linear-gradient(90deg,#b0b0b0,#c8c8c8)':'linear-gradient(270deg,#b0b0b0,#c8c8c8)'};display:flex;flex-direction:column;justify-content:space-around;align-items:center;padding:8px 0` });
+    for (let i = 0; i < Math.max(3, Math.floor(rack.totalU / 3)); i++) {
+      vent.appendChild(el('div', { style: 'width:5px;height:20px;background:#999;border-radius:2px;box-shadow:inset 0 1px 3px rgba(0,0,0,0.4)' }));
+    }
+    wrap.appendChild(vent);
+  });
+  // Inner
+  const inner = el('div', { style: 'display:flex' });
+  // Rails
+  function buildRail(side) {
+    const rail = el('div', { style: `width:${RAIL}px;background:${side==='left'?'linear-gradient(90deg,#c8c8c8,#ddd 40%,#e6e6e6 60%,#d8d8d8)':'linear-gradient(90deg,#d8d8d8,#e6e6e6 40%,#ddd 60%,#c8c8c8)'};border:1px solid #bbb;${side==='left'?'border-right':'border-left'}:2px solid #b0b0b0` });
+    for (let i = 0; i < rack.totalU; i++) {
+      const row = el('div', { style: `height:${U}px;border-bottom:1px solid #c8c8c8;display:flex;flex-direction:column;align-items:center;justify-content:space-around;padding:2px 0` });
+      const mh = () => {
+        const m = el('div', { style: 'width:12px;height:7px;border-radius:1px;border:1px solid #b0b0b0;background:linear-gradient(180deg,#d0d0d0,#bbb);display:flex;align-items:center;justify-content:center;box-shadow:inset 0 1px 2px rgba(0,0,0,0.25)' });
+        m.appendChild(el('div', { style: 'width:5px;height:3px;border-radius:1px;background:#aaa' }));
+        return m;
+      };
+      row.appendChild(mh());
+      row.appendChild(el('span', { style: 'font-size:7.5px;color:#888;font-family:monospace;font-weight:700' }, String(rack.totalU - i)));
+      row.appendChild(mh());
+      rail.appendChild(row);
+    }
+    return rail;
+  }
+  inner.appendChild(buildRail('left'));
+  // Bay
+  const bay = el('div', { id:'rack-bay', style: `flex:1;position:relative;min-height:${rack.totalU*U}px;background:#1a1a1a;box-shadow:inset 5px 0 14px rgba(0,0,0,0.5),inset -5px 0 14px rgba(0,0,0,0.5),inset 0 8px 20px rgba(0,0,0,0.4)` });
+  bay.appendChild(el('div', { style: 'position:absolute;bottom:0;left:0;right:0;height:28px;background:linear-gradient(0deg,rgba(0,0,0,0.4),transparent);pointer-events:none;z-index:1' }));
+  bay.appendChild(el('div', { style: 'position:absolute;top:0;left:0;right:0;height:12px;background:linear-gradient(180deg,rgba(0,0,0,0.3),transparent);pointer-events:none;z-index:1' }));
+  // ── Rack items ──────────────────────────────────────────────────────────────
+  sorted.forEach(item => {
+    const isSelected = selectedId === item.id;
+    const isDragging = state.rackDragId === item.id;
+
+    const itemWrap = el('div', {
+      'data-rackid': item.id,
+      style: `position:absolute;left:0;right:0;top:${(item.slot-1)*U}px;height:${item.units*U}px;` +
+             `z-index:${isSelected?4:3};outline:${isSelected?'2px solid #2f81f7':'none'};outline-offset:-1px;` +
+             `cursor:grab;opacity:${isDragging?0.3:1};transition:opacity 0.12s;box-sizing:border-box;`
+    });
+    itemWrap.classList.add('fadein');
+    itemWrap.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      // Don't start drag on port buttons or cable tool
+      if (e.target.tagName === 'BUTTON' || tool === 'cable') return;
+      e.preventDefault();
+      DragMgr.start(null, item.id, e);
+    });
+    itemWrap.addEventListener('click', e => {
+      e.stopPropagation();
+      if (tool === 'delete') removeItem(item.id);
+      else setState(s => ({ selectedId: s.selectedId === item.id ? null : item.id }));
+    });
+
+    // Six-dot drag handle
+    const handle = el('div', {
+      style: 'position:absolute;left:0;top:0;bottom:0;width:18px;z-index:6;cursor:grab;' +
+             'display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.25);'
+    });
+    handle.innerHTML = '<svg width="8" height="18" viewBox="0 0 8 18" xmlns="http://www.w3.org/2000/svg">' +
+      '<circle cx="2" cy="3" r="1.3" fill="#555"/><circle cx="6" cy="3" r="1.3" fill="#555"/>' +
+      '<circle cx="2" cy="9" r="1.3" fill="#555"/><circle cx="6" cy="9" r="1.3" fill="#555"/>' +
+      '<circle cx="2" cy="15" r="1.3" fill="#555"/><circle cx="6" cy="15" r="1.3" fill="#555"/>' +
+      '</svg>';
+    itemWrap.appendChild(handle);
+    itemWrap.appendChild(renderDeviceFaceWithImage(item, cables, selectedPort, handlePortClick));
+    if (item.customName) {
+      itemWrap.appendChild(el('div', {
+        style: 'position:absolute;bottom:3px;left:22px;background:rgba(0,0,0,0.8);border:1px solid #333;border-radius:2px;padding:1px 5px;font-size:8px;color:#aaa;pointer-events:none;z-index:10'
+      }, item.customName));
+    }
+    bay.appendChild(itemWrap);
+  });
+
+  // ── Slot highlight element (controlled by DragMgr) ──────────────────────
+  const slotHL = el('div', {
+    style: 'position:absolute;left:0;right:0;display:none;background:rgba(47,129,247,0.18);' +
+           'border-top:2px solid #2f81f7;border-bottom:2px solid #2f81f7;pointer-events:none;z-index:20;'
+  });
+  slotHL.id = 'rack-slot-highlight';
+  const hlLabel = el('div', {
+    style: 'position:absolute;top:50%;left:14px;transform:translateY(-50%);font-size:11px;' +
+           'color:#2f81f7;font-weight:600;background:rgba(0,0,0,0.75);padding:2px 10px;border-radius:4px;'
+  });
+  hlLabel.className = 'hl-label';
+  slotHL.appendChild(hlLabel);
+  bay.appendChild(slotHL);
+
+  // Click on empty bay area to deselect
+  bay.addEventListener('click', e => {
+    if (!e.target.closest('button')) setState({ selectedId: null });
+  });
+
+  // ── Cable SVG overlay — drawn on top of rack bay ─────────────────────────
+  const cableSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  cableSvg.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:15;overflow:visible';
+  cableSvg.id = 'cable-svg';
+
+  // Draw cables after DOM is painted so port positions are known
+  requestAnimationFrame(() => {
+    const svgEl = document.getElementById('cable-svg');
+    const bayEl = document.getElementById('rack-bay');
+    if (!svgEl || !bayEl) return;
+    svgEl.innerHTML = '';
+    const bayRect = bayEl.getBoundingClientRect();
+
+    cables.forEach(cable => {
+      const fromEl = bayEl.querySelector(`[data-portid="${cable.fromPortId}"]`);
+      const toEl   = bayEl.querySelector(`[data-portid="${cable.toPortId}"]`);
+      if (!fromEl || !toEl) return;
+
+      const fr = fromEl.getBoundingClientRect();
+      const tr = toEl.getBoundingClientRect();
+
+      // Center of each port relative to bay
+      const x1 = fr.left + fr.width/2  - bayRect.left;
+      const y1 = fr.top  + fr.height/2 - bayRect.top;
+      const x2 = tr.left + tr.width/2  - bayRect.left;
+      const y2 = tr.top  + tr.height/2 - bayRect.top;
+
+      // Bezier curve — exits right side of rack, curves around
+      const midX = Math.max(x1, x2) + 40 + Math.abs(y2 - y1) * 0.15;
+      const cp1x = midX, cp1y = y1;
+      const cp2x = midX, cp2y = y2;
+
+      // Shadow path (darker, slightly thicker)
+      const shadow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      shadow.setAttribute('d', `M${x1},${y1} C${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`);
+      shadow.setAttribute('fill', 'none');
+      shadow.setAttribute('stroke', 'rgba(0,0,0,0.5)');
+      shadow.setAttribute('stroke-width', '5');
+      shadow.setAttribute('stroke-linecap', 'round');
+      svgEl.appendChild(shadow);
+
+      // Main cable path
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', `M${x1},${y1} C${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`);
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke', cable.color);
+      path.setAttribute('stroke-width', '3');
+      path.setAttribute('stroke-linecap', 'round');
+      svgEl.appendChild(path);
+
+      // Dot at each end
+      [x1,y1,x2,y2].forEach((_,i,a) => {
+        if (i % 2 !== 0) return;
+        const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        dot.setAttribute('cx', a[i]);
+        dot.setAttribute('cy', a[i+1]);
+        dot.setAttribute('r', '3.5');
+        dot.setAttribute('fill', cable.color);
+        dot.setAttribute('stroke', '#0d1117');
+        dot.setAttribute('stroke-width', '1.5');
+        svgEl.appendChild(dot);
+      });
+    });
+  });
+
+  bay.appendChild(cableSvg);
+
+    inner.appendChild(bay);
+  inner.appendChild(buildRail('right'));
+  wrap.appendChild(inner);
+  return wrap;
+}
+
+function buildProps(item, rack, cables) {
+  const wrap = el('div', { style: 'padding:16px;display:flex;flex-direction:column;gap:14px' });
+  // Preview
+  const prev = el('div', { style: 'height:44px;background:#0d1117;border-radius:6px;border:1px solid #30363d;overflow:hidden' });
+  prev.appendChild(renderDeviceFace(item, cables, null));
+  wrap.appendChild(prev);
+  // Name
+  const nameDiv = el('div');
+  nameDiv.appendChild(el('div', { style: 'font-size:14px;font-weight:700;color:#f0f6fc' }, item.name));
+  nameDiv.appendChild(el('div', { style: 'font-size:11px;color:#484f58;margin-top:2px' }, item.desc || ''));
+  nameDiv.appendChild(el('div', { style: 'font-size:10px;color:#484f58;margin-top:1px' }, item.units+'U · '+(item.vendor||'')));
+  const imgCached = imageCache[item.id];
+  const fetchBtn = el('button', {
+    style: 'margin-top:8px;width:100%;padding:6px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid;' +
+      (imgCached && imgCached.url ? 'background:#0f2218;color:#22c55e;border-color:#166534;' :
+       imgCached && imgCached.loading ? 'background:#1c2333;color:#484f58;border-color:#293548;' :
+       'background:#1c2333;color:#2f81f7;border-color:#1c3a6f;'),
+    onclick: () => { delete imageCache[item.id]; fetchDeviceImage(item); render(); }
+  }, imgCached && imgCached.url ? '✓ Foto gevonden — opnieuw zoeken' :
+     imgCached && imgCached.loading ? '⏳ Foto zoeken...' :
+     '🔍 Zoek productfoto automatisch');
+  nameDiv.appendChild(fetchBtn);
+  wrap.appendChild(nameDiv);
+  wrap.appendChild(el('div', { style: 'height:1px;background:#30363d' }));
+  // Position
+  wrap.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;letter-spacing:0.5px' }, 'POSITIE'));
+  [['U-hoogte', item.units+'U'], ['Start U', item.slot], ['Eind U', item.slot+item.units-1], ['Rotatie', '0°']].forEach(([l,v]) => {
+    const r = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px' });
+    r.appendChild(el('span', { style: 'font-size:12px;color:#8b949e' }, l));
+    r.appendChild(el('div', { style: 'background:#21262d;border:1px solid #30363d;border-radius:5px;padding:3px 10px;font-size:12px;color:#e2e8f0;min-width:60px;text-align:right' }, String(v)));
+    wrap.appendChild(r);
+  });
+  wrap.appendChild(el('div', { style: 'height:1px;background:#30363d' }));
+  wrap.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;letter-spacing:0.5px' }, 'INFORMATIE'));
+  [['Breedte','19 inch'],['Hoogte',`${item.units}U (${Math.round(item.units*44.45)}mm)`],['Diepte',`${rack?.depth||600} mm`],['Vendor',item.vendor||'—'],['Model',item.name]].forEach(([l,v]) => {
+    const r = el('div', { style: 'display:flex;justify-content:space-between;margin-bottom:6px' });
+    r.appendChild(el('span', { style: 'font-size:11px;color:#8b949e' }, l));
+    r.appendChild(el('span', { style: 'font-size:11px;color:#e2e8f0;max-width:130px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, String(v)));
+    wrap.appendChild(r);
+  });
+  wrap.appendChild(el('div', { style: 'height:1px;background:#30363d' }));
+  // Label
+  wrap.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;letter-spacing:0.5px' }, 'LABEL'));
+  const labelInput = el('input', { style: 'width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:12px;outline:none', placeholder: 'Eigen label...' });
+  labelInput.value = item.customName || '';
+  labelInput.addEventListener('input', e => updateItem(item.id, { customName: e.target.value }));
+  labelInput.addEventListener('focus', () => labelInput.style.borderColor = '#2f81f7');
+  labelInput.addEventListener('blur', () => labelInput.style.borderColor = '#30363d');
+  wrap.appendChild(labelInput);
+  // Notes
+  wrap.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;letter-spacing:0.5px' }, 'NOTITIES'));
+  const ta = el('textarea', { style: 'width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:12px;outline:none;resize:vertical;min-height:60px', placeholder: 'Voeg notities toe...' });
+  ta.addEventListener('focus', () => ta.style.borderColor = '#2f81f7');
+  ta.addEventListener('blur', () => ta.style.borderColor = '#30363d');
+  wrap.appendChild(ta);
+  // Delete
+  const delBtn = el('button', {
+    style: 'padding:8px;background:rgba(218,54,51,0.15);border:1px solid rgba(218,54,51,0.4);border-radius:7px;color:#f85149;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;width:100%',
+    onclick: () => removeItem(item.id)
+  }, '🗑 Verwijder component');
+  wrap.appendChild(delBtn);
+  return wrap;
+}
+
+function buildRackInfo(rack, usedU) {
+  const wrap = el('div', { style: 'background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px' });
+  wrap.appendChild(el('div', { style: 'font-size:11px;font-weight:700;color:#8b949e;letter-spacing:0.5px;margin-bottom:10px' }, 'RACK INFO'));
+  [['Naam',rack.name],['Hoogte',rack.totalU+'U'],['Diepte',rack.depth+'mm'],['Gebruikt',usedU+'U'],['Vrij',(rack.totalU-usedU)+'U'],['Items',rack.items.length]].forEach(([l,v]) => {
+    const r = el('div', { style: 'display:flex;justify-content:space-between;margin-bottom:5px' });
+    r.appendChild(el('span', { style: 'font-size:11px;color:#484f58' }, l));
+    r.appendChild(el('span', { style: 'font-size:11px;color:#8b949e;font-weight:500' }, String(v)));
+    wrap.appendChild(r);
+  });
+  return wrap;
+}
+
+function buildNewRackModal(name, u, depth) {
+  const overlay = el('div', { style: 'position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:300', onclick: () => setState({showNewRack:false}) });
+  const modal = el('div', { style: 'background:#161b22;border:1px solid #30363d;border-radius:14px;width:380px;padding:26px;box-shadow:0 20px 50px rgba(0,0,0,0.9)' });
+  modal.addEventListener('click', e => e.stopPropagation());
+  modal.appendChild(el('div', { style: 'font-size:16px;font-weight:700;color:#f0f6fc;margin-bottom:4px' }, 'Nieuw rack'));
+  modal.appendChild(el('div', { style: 'font-size:12px;color:#484f58;margin-bottom:20px' }, 'Maak een nieuw rack aan'));
+  modal.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;margin-bottom:5px' }, 'Naam'));
+  const nameI = el('input', { style: 'width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;padding:7px 10px;font-size:13px;outline:none;margin-bottom:14px' });
+  nameI.value = name;
+  nameI.addEventListener('input', e => setState({ newRackName: e.target.value }));
+  modal.appendChild(nameI);
+  modal.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;margin-bottom:8px' }, 'Hoogte (U)'));
+  const uBtns = el('div', { style: 'display:flex;gap:6px;margin-bottom:10px' });
+  [9,12,16,24,42].forEach(val => {
+    const b = el('button', { style: `flex:1;padding:6px;border-radius:6px;border:1px solid ${u===val?'#2f81f7':'#30363d'};background:${u===val?'#1c3461':'#21262d'};color:${u===val?'#60a5fa':'#8b949e'};font-size:12px;font-weight:600;cursor:pointer`, onclick: () => setState({ newRackU: val }) }, String(val));
+    uBtns.appendChild(b);
+  });
+  modal.appendChild(uBtns);
+  const slider = el('input', { style: 'width:100%;margin-bottom:4px', type: 'range', min: '4', max: '48' });
+  slider.value = u;
+  slider.addEventListener('input', e => setState({ newRackU: +e.target.value }));
+  modal.appendChild(slider);
+  modal.appendChild(el('div', { style: 'text-align:center;font-size:11px;color:#484f58;margin-bottom:14px' }, `${u}U (${Math.round(u*44.45)}mm)`));
+  modal.appendChild(el('div', { style: 'font-size:11px;font-weight:600;color:#8b949e;margin-bottom:8px' }, 'Diepte'));
+  const dBtns = el('div', { style: 'display:flex;gap:6px;margin-bottom:20px' });
+  [450,600,800,1000].forEach(val => {
+    const b = el('button', { style: `flex:1;padding:6px;border-radius:6px;border:1px solid ${depth===val?'#2f81f7':'#30363d'};background:${depth===val?'#1c3461':'#21262d'};color:${depth===val?'#60a5fa':'#8b949e'};font-size:11px;cursor:pointer`, onclick: () => setState({ newRackDepth: val }) }, `${val}mm`);
+    dBtns.appendChild(b);
+  });
+  modal.appendChild(dBtns);
+  const btns = el('div', { style: 'display:flex;gap:10px' });
+  const create = el('button', { style: 'flex:1;padding:10px;background:#2f81f7;border:none;border-radius:8px;color:#fff;font-size:13px;font-weight:600;cursor:pointer', onclick: () => {
+    const r = { id: genId(), name: state.newRackName || 'Rack', totalU: state.newRackU, depth: state.newRackDepth, items: [] };
+    setState({ rack: r, showNewRack: false });
+  }}, 'Aanmaken');
+  const cancel = el('button', { style: 'padding:10px 16px;background:#21262d;border:none;border-radius:8px;color:#8b949e;font-size:13px;cursor:pointer', onclick: () => setState({ showNewRack: false }) }, 'Annuleer');
+  btns.appendChild(create); btns.appendChild(cancel);
+  modal.appendChild(btns);
+  overlay.appendChild(modal);
+  // Show loaded status if images are already cached
+  if (githubImagesLoaded && Object.keys(deviceImageCache).length > 0) {
+    const statusEl = modal.querySelector('#gh-status');
+    const countEl = modal.querySelector('#gh-count');
+    if (statusEl) statusEl.style.display = 'block';
+    if (countEl) countEl.textContent = Object.keys(deviceImageCache).length;
+  }
+  return overlay;
+}
+
+function buildPhotoModal(img, analyzing, result) {
+  const overlay = el('div', { style: 'position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:300', onclick: () => setState({ showPhoto: false, photoImg: null, photoResult: null }) });
+  const modal = el('div', { style: 'background:#161b22;border:1px solid #30363d;border-radius:14px;width:480px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,0.9)' });
+  modal.addEventListener('click', e => e.stopPropagation());
+  const hdr = el('div', { style: 'padding:16px 20px;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between;flex-shrink:0' });
+  const hdrText = el('div');
+  hdrText.appendChild(el('div', { style: 'font-size:15px;font-weight:700;color:#f0f6fc' }, '📷 Foto analyseren met AI'));
+  hdrText.appendChild(el('div', { style: 'font-size:11px;color:#484f58;margin-top:2px' }, 'Upload foto van een netwerkapparaat'));
+  hdr.appendChild(hdrText);
+  hdr.appendChild(el('button', { style: 'width:28px;height:28px;border-radius:7px;background:#21262d;border:none;color:#8b949e;cursor:pointer;font-size:15px', onclick: () => setState({ showPhoto: false, photoImg: null, photoResult: null }) }, '×'));
+  modal.appendChild(hdr);
+  const body = el('div', { style: 'overflow-y:auto;flex:1;padding:20px' });
+  if (!img) {
+    const dropZone = el('div', { style: 'border:2px dashed #30363d;border-radius:10px;padding:48px;text-align:center;cursor:pointer;transition:all 0.15s' });
+    dropZone.addEventListener('mouseenter', () => { dropZone.style.borderColor = '#2f81f7'; dropZone.style.background = '#0d1f35'; });
+    dropZone.addEventListener('mouseleave', () => { dropZone.style.borderColor = '#30363d'; dropZone.style.background = 'transparent'; });
+    dropZone.addEventListener('click', () => {
+      const fi = document.createElement('input');
+      fi.type = 'file'; fi.accept = 'image/*';
+      fi.addEventListener('change', e => {
+        const f = e.target.files[0]; if (!f) return;
+        const r = new FileReader();
+        r.onload = ev => setState({ photoImg: ev.target.result, photoResult: null });
+        r.readAsDataURL(f);
+      });
+      fi.click();
+    });
+    dropZone.appendChild(el('div', { style: 'font-size:36px;margin-bottom:10px' }, '📷'));
+    dropZone.appendChild(el('div', { style: 'font-size:14px;font-weight:600;color:#8b949e' }, 'Klik om foto te uploaden'));
+    dropZone.appendChild(el('div', { style: 'font-size:11px;color:#484f58;margin-top:4px' }, 'JPG, PNG of WEBP'));
+    body.appendChild(dropZone);
+  } else {
+    const imgWrap = el('div', { style: 'position:relative;margin-bottom:14px' });
+    imgWrap.appendChild(el('img', { src: img, style: 'width:100%;max-height:200px;object-fit:contain;border-radius:8px;border:1px solid #30363d;background:#0d1117' }));
+    imgWrap.appendChild(el('button', { style: 'position:absolute;top:8px;right:8px;width:24px;height:24px;border-radius:5px;background:rgba(0,0,0,0.8);border:1px solid #30363d;color:#8b949e;cursor:pointer;font-size:13px', onclick: () => setState({ photoImg: null, photoResult: null }) }, '×'));
+    body.appendChild(imgWrap);
+    if (!result) {
+      body.appendChild(el('button', { style: `width:100%;padding:11px;background:${analyzing?'#21262d':'#2f81f7'};border:none;border-radius:8px;color:${analyzing?'#484f58':'#fff'};font-size:13px;font-weight:600;cursor:${analyzing?'default':'pointer'}`, onclick: analyzePhoto }, analyzing ? '⏳ Analyseren...' : '⚡ Analyseer met AI'));
+    }
+  }
+  if (result && !result.error) {
+    const res = el('div', { style: 'margin-top:14px;background:#0d2218;border:1px solid #1a4731;border-radius:10px;overflow:hidden' });
+    const resHdr = el('div', { style: 'padding:10px 14px;border-bottom:1px solid #1a4731;display:flex;align-items:center;gap:7px' });
+    resHdr.appendChild(el('div', { style: 'width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 5px #22c55e' }));
+    resHdr.appendChild(el('span', { style: 'font-size:12px;font-weight:600;color:#22c55e' }, 'Apparaat herkend'));
+    res.appendChild(resHdr);
+    const resBody = el('div', { style: 'padding:14px 16px' });
+    const grid = el('div', { style: 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:12px' });
+    [['Merk',result.brand],['Model',result.name],['Poorten',result.ports],['Type',(result.portType||'').toUpperCase()],['Hoogte',result.units+'U']].forEach(([l,v]) => {
+      const cell = el('div', { style: 'background:#0d1117;border-radius:5px;padding:7px 9px' });
+      cell.appendChild(el('div', { style: 'font-size:9px;color:#484f58;margin-bottom:1px' }, l));
+      cell.appendChild(el('div', { style: 'font-size:12px;font-weight:600;color:#e2e8f0' }, String(v||'—')));
+      grid.appendChild(cell);
+    });
+    resBody.appendChild(grid);
+    if (result.notes) resBody.appendChild(el('p', { style: 'font-size:11px;color:#484f58;margin-bottom:12px;line-height:1.6' }, result.notes));
+    resBody.appendChild(el('button', { style: 'width:100%;padding:10px;background:#1a4731;border:1px solid #22c55e44;border-radius:7px;color:#22c55e;font-size:13px;font-weight:600;cursor:pointer', onclick: () => { addItem({ ...result, id: `photo-${genId()}` }); setState({ showPhoto: false, photoImg: null, photoResult: null }); } }, '✓ Toevoegen aan rack'));
+    res.appendChild(resBody);
+    body.appendChild(res);
+  }
+  if (result?.error) body.appendChild(el('div', { style: 'margin-top:12px;padding:12px;background:#2d1315;border:1px solid #6e2020;border-radius:8px;font-size:12px;color:#f85149' }, 'Fout: ' + result.error));
+  modal.appendChild(body);
+  overlay.appendChild(modal);
+  // Show loaded status if images are already cached
+  if (githubImagesLoaded && Object.keys(deviceImageCache).length > 0) {
+    const statusEl = modal.querySelector('#gh-status');
+    const countEl = modal.querySelector('#gh-count');
+    if (statusEl) statusEl.style.display = 'block';
+    if (countEl) countEl.textContent = Object.keys(deviceImageCache).length;
+  }
+  return overlay;
+}
+
+function buildGithubModal() {
+  const overlay = el('div', {
+    style: 'position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:300',
+    onclick: () => setState({ showGithubConfig: false })
+  });
+  const modal = el('div', {
+    style: 'background:#161b22;border:1px solid #30363d;border-radius:14px;width:460px;padding:28px;box-shadow:0 20px 50px rgba(0,0,0,0.9)',
+    onclick: e => e.stopPropagation()
+  });
+
+  modal.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <span style="font-size:20px">🐙</span>
+      <div style="font-size:16px;font-weight:700;color:#f0f6fc">GitHub Afbeeldingen</div>
+    </div>
+    <div style="font-size:12px;color:#484f58;margin-bottom:22px;line-height:1.6">
+      Maak een GitHub repo aan met productfoto's van je apparaten.<br>
+      Bestandsnaam = modelnaam, bijv. <code style="background:#21262d;padding:1px 5px;border-radius:3px;color:#79c0ff">USW-24-POE.png</code>
+    </div>
+
+    <label style="display:block;margin-bottom:12px">
+      <div style="font-size:11px;font-weight:600;color:#8b949e;margin-bottom:5px">GitHub Gebruikersnaam</div>
+      <input id="gh-owner" value="${GITHUB_IMAGE_REPO.owner}"
+        placeholder="bijv. jouwgebruikersnaam"
+        style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;padding:8px 12px;font-size:13px;outline:none;box-sizing:border-box"/>
+    </label>
+    <label style="display:block;margin-bottom:12px">
+      <div style="font-size:11px;font-weight:600;color:#8b949e;margin-bottom:5px">Repository Naam</div>
+      <input id="gh-repo" value="${GITHUB_IMAGE_REPO.repo}"
+        placeholder="bijv. rack-device-images"
+        style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;padding:8px 12px;font-size:13px;outline:none;box-sizing:border-box"/>
+    </label>
+    <label style="display:block;margin-bottom:20px">
+      <div style="font-size:11px;font-weight:600;color:#8b949e;margin-bottom:5px">Branch</div>
+      <input id="gh-branch" value="${GITHUB_IMAGE_REPO.branch || 'main'}"
+        placeholder="main"
+        style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;padding:8px 12px;font-size:13px;outline:none;box-sizing:border-box"/>
+    </label>
+
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:20px;font-size:11px;color:#484f58;line-height:1.8">
+      <strong style="color:#8b949e">Stap voor stap:</strong><br>
+      1. Ga naar <a href="https://github.com/new" target="_blank" style="color:#2f81f7">github.com/new</a> → maak repo aan<br>
+      2. Upload PNG foto's van je apparaten<br>
+      3. Vul hierboven je gebruikersnaam + repo naam in<br>
+      4. Klik Opslaan — app laadt alle foto's automatisch
+    </div>
+
+    <div style="display:flex;gap:10px">
+      <button onclick="
+        GITHUB_IMAGE_REPO.owner = document.getElementById('gh-owner').value.trim();
+        GITHUB_IMAGE_REPO.repo = document.getElementById('gh-repo').value.trim();
+        GITHUB_IMAGE_REPO.branch = document.getElementById('gh-branch').value.trim() || 'main';
+        githubImagesLoaded = false;
+        githubLoadPromise = null;
+        Object.keys(deviceImageCache).forEach(k => delete deviceImageCache[k]);
+        setState({ showGithubConfig: false });
+        loadGithubImages();
+      " style="flex:1;padding:10px;background:#2f81f7;border:none;border-radius:8px;color:#fff;font-size:13px;font-weight:600;cursor:pointer">
+        💾 Opslaan & Laden
+      </button>
+      <button onclick="setState({ showGithubConfig: false })"
+        style="padding:10px 18px;background:#21262d;border:none;border-radius:8px;color:#8b949e;font-size:13px;cursor:pointer">
+        Annuleer
+      </button>
+    </div>
+
+  `;
+
+  overlay.appendChild(modal);
+  // Show loaded status if images are already cached
+  if (githubImagesLoaded && Object.keys(deviceImageCache).length > 0) {
+    const statusEl = modal.querySelector('#gh-status');
+    const countEl = modal.querySelector('#gh-count');
+    if (statusEl) statusEl.style.display = 'block';
+    if (countEl) countEl.textContent = Object.keys(deviceImageCache).length;
+  }
+  return overlay;
+}
+
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+render();
+// Start loading GitHub images immediately
+loadGithubImages();
+</script>
+</body>
+</html>
